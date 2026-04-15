@@ -35,7 +35,11 @@ vm-memory = "0.16.0"
 vm-migration = { path = "../vm-migration" }
 vm-virtio = { path = "../vm-virtio" }
 vmm = { path = "../vmm", features = ["guest_debug"] }
+serde_json = "1"
 vmm-sys-util = "0.14.0"
+
+[dev-dependencies]
+hegeltest = "0.3"
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -69,6 +73,12 @@ test = false
 doc = false
 name = "http_api"
 path = "fuzz_targets/http_api.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "image_detect"
+path = "fuzz_targets/image_detect.rs"
 test = false
 
 [[bin]]
@@ -141,6 +151,12 @@ test = false
 doc = false
 name = "watchdog"
 path = "fuzz_targets/watchdog.rs"
+test = false
+
+[[bin]]
+doc = false
+name = "migration_recv"
+path = "fuzz_targets/migration_recv.rs"
 test = false
 
 [[bin]]
