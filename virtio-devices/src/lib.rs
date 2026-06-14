@@ -142,6 +142,9 @@ pub enum Error {
     SetShmRegionsNotSupported,
     #[error("Failed to process net queue")]
     NetQueuePair(#[source] ::net_util::NetQueuePairError),
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[error("Failed to process AF_XDP net queue")]
+    XdpQueuePair(#[source] ::net_util::XdpQueuePairError),
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

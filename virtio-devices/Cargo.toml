@@ -9,6 +9,7 @@ version = "0.1.0"
 default = []
 kvm = ["pci/kvm"]
 mshv = ["pci/mshv"]
+net_backend_af_xdp = ["net_util/net_backend_af_xdp"]
 sev_snp = ["mshv-ioctls"]
 
 [dependencies]

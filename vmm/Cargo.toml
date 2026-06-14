@@ -31,6 +31,10 @@ mshv = [
   "virtio-devices/mshv",
   "vm-device/mshv",
 ]
+net_backend_af_xdp = [
+  "net_util/net_backend_af_xdp",
+  "virtio-devices/net_backend_af_xdp",
+]
 pvmemcontrol = ["devices/pvmemcontrol"]
 sev_snp = [
   "arch/sev_snp",

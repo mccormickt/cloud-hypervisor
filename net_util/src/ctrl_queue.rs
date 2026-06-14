@@ -88,6 +88,16 @@ impl CtrlQueue {
         CtrlQueue { taps }
     }
 
+    /// Create a control queue with no backing tap.
+    ///
+    /// Used by backends such as AF_XDP that negotiate the queue count over the
+    /// control queue (`VIRTIO_NET_CTRL_MQ`) but have no tap to reprogram. With
+    /// no taps, an offload-set command is accepted as a no-op — harmless since
+    /// such backends advertise no offload features.
+    pub fn new_without_tap() -> Self {
+        CtrlQueue { taps: Vec::new() }
+    }
+
     pub fn process(
         &mut self,
         mem: &GuestMemoryMmap,

@@ -279,6 +279,23 @@ pub enum ValidationError {
     /// Hardware checksum offload is disabled.
     #[error("\"offload_tso\" and \"offload_ufo\" depend on \"offload_csum\"")]
     NoHardwareChecksumOffload,
+    /// AF_XDP backend requested but the feature was not compiled in.
+    #[error(
+        "AF_XDP network backend requested but cloud-hypervisor was built without the \"net_backend_af_xdp\" feature"
+    )]
+    XdpFeatureDisabled,
+    /// AF_XDP backend requires the host interface name.
+    #[error("AF_XDP network backend requires \"xdp_iface\"")]
+    XdpMissingIface,
+    /// AF_XDP backend cannot be combined with TAP/fd/vhost-user selectors.
+    #[error("AF_XDP network backend cannot be combined with \"tap\", \"fd\", or \"vhost_user\"")]
+    XdpConflictingBackend,
+    /// AF_XDP backend does not support a virtual IOMMU.
+    #[error("AF_XDP network backend does not support being placed behind an IOMMU")]
+    XdpIommuNotSupported,
+    /// Requested MTU exceeds the AF_XDP single-frame budget.
+    #[error("AF_XDP MTU {0} exceeds the maximum {1} imposed by the aligned-chunk UMEM frame size")]
+    XdpMtuTooLarge(u16 /* requested */, u16 /* maximum */),
     /// Hugepages not turned on
     #[error("Huge page size specified but huge pages not enabled")]
     HugePageSizeWithoutHugePages,
@@ -1644,11 +1661,31 @@ impl FromStr for VhostMode {
     }
 }
 
+#[derive(Debug)]
+pub enum ParseNetBackendError {
+    InvalidValue(String),
+}
+
+impl FromStr for NetBackend {
+    type Err = ParseNetBackendError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "tap" => Ok(NetBackend::Tap),
+            "vhost_user" | "vhost-user" => Ok(NetBackend::VhostUser),
+            "xdp" | "af_xdp" | "af-xdp" => Ok(NetBackend::AfXdp),
+            _ => Err(ParseNetBackendError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
 impl NetConfig {
     pub const SYNTAX: &'static str = "Network parameters \
     \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,fd=<[fd1,fd2,...]>,iommu=on|off,\
     num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,\
+    backend=tap|vhost_user|xdp,\
     vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
+    xdp_iface=<host_if_name>,xdp_peer=<veth_peer_name>,xdp_skb=on|off,xdp_zerocopy=on|off,\
     bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
     ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
@@ -1669,9 +1706,14 @@ impl NetConfig {
             .add("mtu")
             .add("queue_size")
             .add("num_queues")
+            .add("backend")
             .add("vhost_user")
             .add("socket")
             .add("vhost_mode")
+            .add("xdp_iface")
+            .add("xdp_peer")
+            .add("xdp_skb")
+            .add("xdp_zerocopy")
             .add("fd")
             .add("bw_size")
             .add("bw_one_time_burst")
@@ -1715,7 +1757,7 @@ impl NetConfig {
             .convert("num_queues")
             .map_err(Error::ParseNetwork)?
             .unwrap_or_else(default_netconfig_num_queues);
-        let vhost_user = parser
+        let mut vhost_user = parser
             .convert::<Toggle>("vhost_user")
             .map_err(Error::ParseNetwork)?
             .unwrap_or(Toggle(false))
@@ -1725,6 +1767,32 @@ impl NetConfig {
             .convert("vhost_mode")
             .map_err(Error::ParseNetwork)?
             .unwrap_or_default();
+        let xdp_iface = parser.get("xdp_iface");
+        let xdp_peer = parser.get("xdp_peer");
+        let xdp_skb = parser
+            .convert::<Toggle>("xdp_skb")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let xdp_zerocopy = parser
+            .convert::<Toggle>("xdp_zerocopy")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(false))
+            .0;
+        // Resolve the backend selector. `backend=` is authoritative; the legacy
+        // `vhost_user=on` flag maps to `NetBackend::VhostUser`, and selecting the
+        // vhost-user backend keeps `vhost_user` true so the existing device path
+        // and validation rules apply unchanged.
+        let mut backend = parser
+            .convert::<NetBackend>("backend")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or_default();
+        if vhost_user && backend == NetBackend::Tap {
+            backend = NetBackend::VhostUser;
+        }
+        if backend == NetBackend::VhostUser {
+            vhost_user = true;
+        }
         let fds = parser
             .convert::<IntegerList>("fd")
             .map_err(Error::ParseNetwork)?
@@ -1784,6 +1852,7 @@ impl NetConfig {
 
         let config = NetConfig {
             pci_common,
+            backend,
             tap,
             ip,
             mask,
@@ -1800,6 +1869,10 @@ impl NetConfig {
             offload_tso,
             offload_ufo,
             offload_csum,
+            xdp_iface,
+            xdp_peer,
+            xdp_skb,
+            xdp_zerocopy,
         };
         Ok(config)
     }
@@ -1858,6 +1931,28 @@ impl NetConfig {
 
         if self.ip.is_some() && self.mask.is_none() {
             return Err(ValidationError::IpProvidedWithoutMask);
+        }
+
+        if self.backend == NetBackend::AfXdp {
+            // `cfg!` keeps every check compiled (and lint-clean) regardless of
+            // the feature, while still failing fast when the datapath is absent.
+            if !cfg!(feature = "net_backend_af_xdp") {
+                return Err(ValidationError::XdpFeatureDisabled);
+            }
+            if self.tap.is_some() || self.fds.is_some() || self.vhost_user {
+                return Err(ValidationError::XdpConflictingBackend);
+            }
+            if self.pci_common.iommu {
+                return Err(ValidationError::XdpIommuNotSupported);
+            }
+            if self.xdp_iface.is_none() {
+                return Err(ValidationError::XdpMissingIface);
+            }
+            if let Some(mtu) = self.mtu
+                && mtu > net_util::XDP_MAX_MTU
+            {
+                return Err(ValidationError::XdpMtuTooLarge(mtu, net_util::XDP_MAX_MTU));
+            }
         }
 
         Ok(())
@@ -4305,6 +4400,7 @@ mod unit_tests {
     fn net_fixture() -> NetConfig {
         NetConfig {
             pci_common: PciDeviceCommonConfig::default(),
+            backend: NetBackend::Tap,
             tap: None,
             ip: None,
             mask: None,
@@ -4321,6 +4417,10 @@ mod unit_tests {
             offload_tso: true,
             offload_ufo: true,
             offload_csum: true,
+            xdp_iface: None,
+            xdp_peer: None,
+            xdp_skb: false,
+            xdp_zerocopy: false,
         }
     }
 
@@ -4360,8 +4460,37 @@ mod unit_tests {
                 "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock"
             )?,
             NetConfig {
+                backend: NetBackend::VhostUser,
                 vhost_user: true,
                 vhost_socket: Some("/tmp/sock".to_owned()),
+                ..net_fixture()
+            }
+        );
+
+        // `backend=vhost_user` is equivalent to the legacy `vhost_user=on`.
+        assert_eq!(
+            NetConfig::parse(
+                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,backend=vhost_user,socket=/tmp/sock"
+            )?,
+            NetConfig {
+                backend: NetBackend::VhostUser,
+                vhost_user: true,
+                vhost_socket: Some("/tmp/sock".to_owned()),
+                ..net_fixture()
+            }
+        );
+
+        // AF_XDP backend selection and its keys.
+        assert_eq!(
+            NetConfig::parse(
+                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,backend=xdp,xdp_iface=eth0,xdp_peer=veth1,xdp_skb=on,xdp_zerocopy=on"
+            )?,
+            NetConfig {
+                backend: NetBackend::AfXdp,
+                xdp_iface: Some("eth0".to_owned()),
+                xdp_peer: Some("veth1".to_owned()),
+                xdp_skb: true,
+                xdp_zerocopy: true,
                 ..net_fixture()
             }
         );
@@ -6315,6 +6444,62 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config.validate(),
             Err(ValidationError::IdentifierNotUnique("test0".to_string()))
         );
+
+        // --- AF_XDP backend validation ---
+        let xdp_net = NetConfig {
+            backend: NetBackend::AfXdp,
+            host_mac: None,
+            xdp_iface: Some("eth0".to_string()),
+            ..net_fixture()
+        };
+
+        // Without the feature, the backend is refused outright.
+        #[cfg(not(feature = "net_backend_af_xdp"))]
+        {
+            let mut invalid_config = valid_config.clone();
+            invalid_config.net = Some(vec![xdp_net.clone()]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::XdpFeatureDisabled)
+            );
+        }
+
+        #[cfg(feature = "net_backend_af_xdp")]
+        {
+            let mut ok_config = valid_config.clone();
+            ok_config.net = Some(vec![xdp_net.clone()]);
+            ok_config.validate().unwrap();
+
+            let mut invalid_config = valid_config.clone();
+            invalid_config.net = Some(vec![NetConfig {
+                xdp_iface: None,
+                ..xdp_net.clone()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::XdpMissingIface)
+            );
+
+            let mut invalid_config = valid_config.clone();
+            invalid_config.net = Some(vec![NetConfig {
+                tap: Some("tap0".to_string()),
+                ..xdp_net.clone()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::XdpConflictingBackend)
+            );
+
+            let mut invalid_config = valid_config.clone();
+            invalid_config.net = Some(vec![NetConfig {
+                mtu: Some(9000),
+                ..xdp_net.clone()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::XdpMtuTooLarge(9000, net_util::XDP_MAX_MTU))
+            );
+        }
     }
     #[test]
     fn test_landlock_parsing() -> Result<()> {

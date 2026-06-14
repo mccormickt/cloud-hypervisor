@@ -423,11 +423,26 @@ pub fn default_diskconfig_sparse() -> bool {
     true
 }
 
+/// Backend that drives a virtio-net device's datapath.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetBackend {
+    /// Kernel TAP device (the default).
+    #[default]
+    Tap,
+    /// vhost-user backend running in a separate process.
+    VhostUser,
+    /// In-process AF_XDP (XSK) backend.
+    AfXdp,
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct NetConfig {
     #[serde(flatten)]
     pub pci_common: PciDeviceCommonConfig,
+    #[serde(default)]
+    pub backend: NetBackend,
     #[serde(default = "default_netconfig_tap")]
     pub tap: Option<String>,
     pub ip: Option<IpAddr>,
@@ -463,6 +478,23 @@ pub struct NetConfig {
     pub offload_ufo: bool,
     #[serde(default = "default_netconfig_true")]
     pub offload_csum: bool,
+    /// Host interface AF_XDP binds to (required when `backend == AfXdp`).
+    #[serde(default)]
+    pub xdp_iface: Option<String>,
+    /// Peer interface of a `veth` pair. When set, a pass-through XDP program is
+    /// attached to it so AF_XDP redirect works (veth needs XDP on both ends).
+    /// Leave unset for a real NIC.
+    #[serde(default)]
+    pub xdp_peer: Option<String>,
+    /// Force the XDP redirect program to attach in generic (SKB) mode rather
+    /// than letting the kernel pick native driver mode. Required on `veth` and
+    /// other interfaces without native XDP support.
+    #[serde(default)]
+    pub xdp_skb: bool,
+    /// Request AF_XDP zero-copy mode (`XDP_ZEROCOPY`). Falls back to copy mode
+    /// at bind time on drivers without zero-copy support.
+    #[serde(default)]
+    pub xdp_zerocopy: bool,
 }
 
 pub fn default_netconfig_true() -> bool {
