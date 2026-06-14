@@ -1,0 +1,39 @@
+# Standalone eBPF crate for the in-process AF_XDP backend's XDP redirect
+# program. Excluded from the Cloud Hypervisor workspace because it targets
+# `bpfel-unknown-none` with `-Z build-std=core` on nightly. It is its own
+# one-package workspace so `net_util`'s `build.rs` can build it in isolation via
+# `aya-build` (which runs `cargo build --package xdp-ebpf`).
+[package]
+authors = ["Cloud Hypervisor Authors"]
+edition = "2021"
+name = "xdp-ebpf"
+publish = false
+version = "0.1.0"
+
+[[bin]]
+name = "xdp-redirect"
+path = "src/main.rs"
+
+[dependencies]
+# Kernel-side eBPF support. Pinned to the same fork revision as `net_util`'s
+# `aya`/`aya-build` dependencies.
+aya-ebpf = { git = "https://github.com/mccormickt/aya", rev = "27ffd32b89be2684906256187801fe46a75d1f40" }
+
+# Standalone workspace so the inner cargo invocation does not try to join the
+# Cloud Hypervisor workspace (which excludes this crate).
+[workspace]
+
+[profile.dev]
+codegen-units = 1
+debug = false
+debug-assertions = false
+incremental = false
+lto = true
+opt-level = 3
+overflow-checks = false
+panic = "abort"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
