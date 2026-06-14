@@ -653,6 +653,7 @@ cmd_tests() {
             "${common_args[@]}" \
             "${common_env_args[@]}" \
             --env RUST_BACKTRACE="${RUST_BACKTRACE}" \
+            --env EXTRA_FEATURES="${EXTRA_FEATURES:-}" \
             "${igvm_volume_args[@]}" \
             "$CTR_IMAGE" \
             ./scripts/run_metrics.sh "$@" || fix_dir_perms $? || exit $?

@@ -8,6 +8,11 @@ source "$(dirname "$0")"/test-util.sh
 TEST_ARCH=$(uname -m)
 export TEST_ARCH
 
+# When invoked directly on the host (rather than through scripts/dev_cli.sh,
+# which sets it in the container env), BUILD_TARGET is unset. Default it to the
+# native GNU target so both `cargo build --target` and the artifact path resolve.
+BUILD_TARGET="${BUILD_TARGET:-${TEST_ARCH}-unknown-linux-gnu}"
+
 WORKLOADS_DIR="$HOME/workloads"
 mkdir -p "$WORKLOADS_DIR"
 
@@ -18,6 +23,24 @@ vm_type_arg=""
 if [ "$VM_TYPE" = "confidential" ]; then
     build_features="mshv,igvm,sev_snp"
     vm_type_arg="--vm-type confidential"
+fi
+
+# Opt-in extra build features, e.g. EXTRA_FEATURES=net_backend_af_xdp to measure
+# the in-process AF_XDP backend. That feature compiles an embedded eBPF program,
+# which requires a nightly toolchain (with rust-src) and bpf-linker; the default
+# (no extra features) path is unaffected.
+if [ -n "$EXTRA_FEATURES" ]; then
+    build_features="$build_features,$EXTRA_FEATURES"
+    if [[ "$EXTRA_FEATURES" == *"net_backend_af_xdp"* ]]; then
+        if ! rustup toolchain list 2>/dev/null | grep -q nightly; then
+            echo "net_backend_af_xdp requires nightly: rustup toolchain install nightly --component rust-src"
+            exit 1
+        fi
+        if ! command -v bpf-linker >/dev/null 2>&1; then
+            echo "net_backend_af_xdp requires bpf-linker: cargo install bpf-linker"
+            exit 1
+        fi
+    fi
 fi
 
 if [ "${TEST_ARCH}" == "aarch64" ]; then
