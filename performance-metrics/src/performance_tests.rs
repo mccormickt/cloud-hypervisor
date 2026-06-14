@@ -173,6 +173,64 @@ pub fn performance_net_throughput(control: &PerformanceTestControl) -> f64 {
     }
 }
 
+/// Throughput for the in-process AF_XDP backend. Same measurement as
+/// [`performance_net_throughput`], but instead of a TAP it sets up a veth pair
+/// (torn down on drop) and binds CH's AF_XDP sockets to one end while the host
+/// IP lives on the peer. Requires the `cloud-hypervisor` binary to be built with
+/// the `net_backend_af_xdp` feature (see `EXTRA_FEATURES` in `run_metrics.sh`).
+pub fn performance_net_throughput_xdp(control: &PerformanceTestControl) -> f64 {
+    let test_timeout = control.test_timeout;
+    let (rx, bandwidth) = control.net_control.unwrap();
+
+    let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+    let mut guest = performance_test_new_guest(Box::new(jammy), control);
+
+    let num_queues = control.num_queues.unwrap();
+    let queue_size = control.queue_size.unwrap();
+    let queue_pairs = num_queues / 2;
+
+    // CH binds AF_XDP sockets to `veth-ch0` and loads the XDP redirect program
+    // onto it; the host IP lives on the peer `veth-ch1`. Same /25 subnet as the
+    // TAP path, so `measure_virtio_net_throughput` (which targets `guest_ip0`)
+    // is reused unchanged. Dropped at the end of the test.
+    let veth_dev = "veth-ch0";
+    let veth_peer = "veth-ch1";
+    let _veth = VethPair::new(veth_dev, veth_peer, &guest.network.host_ip0, queue_pairs).unwrap();
+
+    let net_params = format!(
+        "{},num_queues={num_queues},queue_size={queue_size}",
+        guest.default_net_string_xdp(veth_dev, veth_peer),
+    );
+    guest.num_cpu = num_queues;
+    let mut child = GuestCommand::new(&guest)
+        .default_cpus()
+        .args(["--memory", "size=4G"])
+        .default_kernel_cmdline()
+        .default_disks()
+        .args(["--net", net_params.as_str()])
+        .capture_output()
+        .verbosity(VerbosityLevel::Warn)
+        .set_print_cmd(false)
+        .spawn()
+        .unwrap();
+
+    let r = std::panic::catch_unwind(|| {
+        guest.wait_vm_boot().unwrap();
+        measure_virtio_net_throughput(test_timeout, queue_pairs, &guest, rx, bandwidth).unwrap()
+    });
+
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+
+    match r {
+        Ok(r) => r,
+        Err(e) => {
+            handle_child_output(Err(e), &output);
+            panic!("test failed!");
+        }
+    }
+}
+
 pub fn performance_net_latency(control: &PerformanceTestControl) -> f64 {
     let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
     let mut guest = performance_test_new_guest(Box::new(jammy), control);

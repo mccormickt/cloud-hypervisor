@@ -381,7 +381,7 @@ mod adjuster {
     }
 }
 
-const TEST_LIST: [PerformanceTest; 100] = [
+const TEST_LIST: [PerformanceTest; 104] = [
     PerformanceTest {
         name: "boot_time_ms",
         func_ptr: performance_boot_time,
@@ -526,6 +526,53 @@ const TEST_LIST: [PerformanceTest; 100] = [
         func_ptr: performance_net_throughput,
         control: PerformanceTestControl {
             num_queues: Some(4),
+            queue_size: Some(256),
+            net_control: Some((false, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    // In-process AF_XDP backend (single queue; the auto-created veth pair has one
+    // queue). Requires the cloud-hypervisor binary built with the
+    // `net_backend_af_xdp` feature; see `EXTRA_FEATURES` in `run_metrics.sh`.
+    PerformanceTest {
+        name: "virtio_net_throughput_single_queue_rx_xdp_gbps",
+        func_ptr: performance_net_throughput_xdp,
+        control: PerformanceTestControl {
+            num_queues: Some(2),
+            queue_size: Some(256),
+            net_control: Some((true, true)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::bps_to_gbps,
+    },
+    PerformanceTest {
+        name: "virtio_net_throughput_single_queue_tx_xdp_gbps",
+        func_ptr: performance_net_throughput_xdp,
+        control: PerformanceTestControl {
+            num_queues: Some(2),
+            queue_size: Some(256),
+            net_control: Some((false, true)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::bps_to_gbps,
+    },
+    PerformanceTest {
+        name: "virtio_net_throughput_single_queue_rx_xdp_pps",
+        func_ptr: performance_net_throughput_xdp,
+        control: PerformanceTestControl {
+            num_queues: Some(2),
+            queue_size: Some(256),
+            net_control: Some((true, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "virtio_net_throughput_single_queue_tx_xdp_pps",
+        func_ptr: performance_net_throughput_xdp,
+        control: PerformanceTestControl {
+            num_queues: Some(2),
             queue_size: Some(256),
             net_control: Some((false, false)),
             ..PerformanceTestControl::default()

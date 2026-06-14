@@ -153,6 +153,8 @@ pub enum Error {
     Spawn(#[source] std::io::Error),
     #[error("waiting for timeout failed")]
     WaitTimeout(#[source] WaitTimeoutError),
+    #[error("veth pair setup failed: {0}")]
+    VethSetup(String),
 }
 
 /// Polls a boolean condition until it becomes true or the timeout expires.
@@ -1276,6 +1278,18 @@ impl Guest {
         )
     }
 
+    /// Net string for the in-process AF_XDP backend bound to `iface`, with the
+    /// `veth` `peer` carrying the host IP (see [`VethPair`]). No `ip=`/`mask=` is
+    /// passed (the host IP lives on the peer). `xdp_peer` makes CH attach a
+    /// pass-through program to the peer, which AF_XDP redirect on `veth`
+    /// requires (XDP on both ends); native attach mode is used.
+    pub fn default_net_string_xdp(&self, iface: &str, peer: &str) -> String {
+        format!(
+            "backend=xdp,xdp_iface={},xdp_peer={},mac={}",
+            iface, peer, self.network.guest_mac0
+        )
+    }
+
     pub fn default_net_string_w_mtu(&self, mtu: u16) -> String {
         format!(
             "tap=,mac={},ip={},mask=255.255.255.128,mtu={}",
@@ -2336,6 +2350,65 @@ fn child_wait_timeout(child: &mut Child, timeout: u64) -> Result<(), WaitTimeout
     }
 
     Ok(())
+}
+
+/// A veth pair created for AF_XDP throughput tests, torn down on drop.
+///
+/// `dev` is the interface Cloud Hypervisor binds AF_XDP sockets to (and loads
+/// the XDP redirect program onto); `peer` carries the host-side IP. They share
+/// an L2 segment, so host↔guest traffic flows host → `peer` → `dev` → XSK →
+/// guest. Requires root (the metrics harness already runs under sudo).
+pub struct VethPair {
+    dev: String,
+}
+
+impl VethPair {
+    /// Creates `dev`/`peer`, assigns `host_ip/25` to `peer`, and brings both up.
+    /// `num_queues` sets the per-end RX/TX queue count (use 1 for single queue).
+    pub fn new(dev: &str, peer: &str, host_ip: &str, num_queues: u32) -> Result<Self, Error> {
+        // Remove any interface left over from a previously aborted run. Suppress
+        // output (`|| true`) so the expected "Cannot find device" on a clean run
+        // does not print a scary command-failure block.
+        let _ = exec_host_command_status(&format!("ip link del {dev} 2>/dev/null || true"));
+
+        let queues = num_queues.max(1);
+        let setup = [
+            format!(
+                "ip link add {dev} numrxqueues {queues} numtxqueues {queues} type veth \
+                 peer name {peer} numrxqueues {queues} numtxqueues {queues}"
+            ),
+            format!("ip addr add {host_ip}/25 dev {peer}"),
+            format!("ip link set {dev} up"),
+            format!("ip link set {peer} up"),
+        ];
+        for cmd in setup {
+            if !exec_host_command_status(&cmd).success() {
+                let _ = exec_host_command_status(&format!("ip link del {dev}"));
+                return Err(Error::VethSetup(cmd));
+            }
+        }
+
+        // Disable offloads on both ends. AF_XDP delivers raw L2 frames: with TX
+        // checksum offload the host leaves L4 checksums incomplete
+        // (CHECKSUM_PARTIAL) and the guest drops the frames, while GSO/TSO/GRO
+        // would produce frames larger than a UMEM chunk. Best-effort.
+        for end in [dev, peer] {
+            let _ = exec_host_command_status(&format!(
+                "ethtool -K {end} tx off rx off gso off tso off gro off 2>/dev/null || true"
+            ));
+        }
+
+        Ok(Self {
+            dev: dev.to_string(),
+        })
+    }
+}
+
+impl Drop for VethPair {
+    fn drop(&mut self) {
+        // Deleting one end removes the whole pair. Best-effort and quiet.
+        let _ = exec_host_command_status(&format!("ip link del {} 2>/dev/null || true", self.dev));
+    }
 }
 
 pub fn measure_virtio_net_throughput(
