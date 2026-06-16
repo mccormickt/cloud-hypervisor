@@ -23,6 +23,10 @@ use net_util::{
     CtrlQueue, MacAddr, NetCounters, NetQueuePair, OpenTapError, RxVirtio, Tap, TapError, TxVirtio,
     VirtioNetConfig, build_net_config_space, build_net_config_space_with_mq, open_tap,
 };
+#[cfg(feature = "net_backend_af_xdp")]
+use net_util::{
+    XdpAttachMode, XdpProgram, XdpQueuePair, XdpSocketConfig, Xsk, iface_index, iface_mtu,
+};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -151,6 +155,9 @@ pub const TX_TAP_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
 pub const RX_RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 5;
 // New 'wake up' event from the tx rate limiter
 pub const TX_RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 6;
+// A frame is available for reading from the AF_XDP socket to receive in the guest.
+#[cfg(feature = "net_backend_af_xdp")]
+pub const XSK_RX_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 7;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -160,6 +167,15 @@ pub enum Error {
     TapError(#[source] TapError),
     #[error("Error calling dup() on tap fd")]
     DuplicateTapFd(#[source] std::io::Error),
+    // The aya-backed error types are large (~100 bytes); box them so they do not
+    // bloat this enum (and everything that wraps it) past the
+    // `clippy::result_large_err` threshold.
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[error("Failed to resolve or bind the AF_XDP interface")]
+    Xdp(#[source] Box<net_util::XdpError>),
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[error("Failed to load and attach the XDP redirect program")]
+    XdpProgram(#[source] Box<net_util::XdpProgramError>),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -394,6 +410,233 @@ impl EpollHelperHandler for NetEpollHandler {
     }
 }
 
+/// Worker-thread event loop for one AF_XDP queue pair.
+///
+/// Structurally identical to [`NetEpollHandler`] (same epoll machinery, queue
+/// events, rate limiters, and used-queue signalling) but driving an
+/// [`XdpQueuePair`] copy core instead of a TAP. The RX source is the XSK fd's
+/// `EPOLLIN` (`XSK_RX_EVENT`) rather than `RX_TAP_EVENT`; there is no
+/// `TX_TAP_EVENT` analogue because AF_XDP has no writable-fd backpressure
+/// signal — a full TX ring is retried on the next kick.
+#[cfg(feature = "net_backend_af_xdp")]
+struct XdpNetEpollHandler {
+    net: XdpQueuePair,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    interrupt_cb: Arc<dyn VirtioInterrupt>,
+    kill_evt: EventFd,
+    pause_evt: EventFd,
+    queue_index_base: u16,
+    queue_pair: (Queue, Queue),
+    queue_evt_pair: (EventFd, EventFd),
+}
+
+#[cfg(feature = "net_backend_af_xdp")]
+impl XdpNetEpollHandler {
+    fn signal_used_queue(&self, queue_index: u16) -> result::Result<(), DeviceError> {
+        self.interrupt_cb
+            .trigger(VirtioInterruptType::Queue(queue_index))
+            .map_err(|e| {
+                error!("Failed to signal used queue: {e:?}");
+                DeviceError::FailedSignalingUsedQueue(e)
+            })
+    }
+
+    fn handle_rx_event(&mut self) -> result::Result<(), DeviceError> {
+        let queue_evt = &self.queue_evt_pair.0;
+        if let Err(e) = queue_evt.read() {
+            error!("Failed to get rx queue event: {e:?}");
+        }
+
+        self.net.rx_desc_avail = true;
+
+        let rate_limit_reached = self
+            .net
+            .rx_rate_limiter
+            .as_ref()
+            .is_some_and(|r| r.is_blocked());
+
+        // Start listening on the XSK fd only when the rate limit is not reached.
+        if !rate_limit_reached {
+            self.net
+                .register_rx_listener()
+                .map_err(DeviceError::XdpQueuePair)?;
+        }
+
+        Ok(())
+    }
+
+    fn process_tx(&mut self) -> result::Result<(), DeviceError> {
+        let res = self
+            .net
+            .process_tx(&self.mem.memory(), &mut self.queue_pair.1)
+            .map_err(DeviceError::XdpQueuePair)?;
+
+        if res {
+            self.signal_used_queue(self.queue_index_base + 1)?;
+        }
+        Ok(())
+    }
+
+    fn handle_tx_event(&mut self) -> result::Result<(), DeviceError> {
+        let rate_limit_reached = self
+            .net
+            .tx_rate_limiter
+            .as_ref()
+            .is_some_and(|r| r.is_blocked());
+
+        if !rate_limit_reached {
+            self.process_tx()?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_xsk_rx_event(&mut self) -> result::Result<(), DeviceError> {
+        let res = self
+            .net
+            .process_rx(&self.mem.memory(), &mut self.queue_pair.0)
+            .map_err(DeviceError::XdpQueuePair)?;
+
+        if res {
+            self.signal_used_queue(self.queue_index_base)?;
+        }
+        Ok(())
+    }
+
+    fn run(
+        &mut self,
+        paused: &AtomicBool,
+        paused_sync: &Barrier,
+    ) -> result::Result<(), EpollHelperError> {
+        let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
+        helper.add_event(self.queue_evt_pair.0.as_raw_fd(), RX_QUEUE_EVENT)?;
+        helper.add_event(self.queue_evt_pair.1.as_raw_fd(), TX_QUEUE_EVENT)?;
+        if let Some(rate_limiter) = &self.net.rx_rate_limiter {
+            helper.add_event(rate_limiter.as_raw_fd(), RX_RATE_LIMITER_EVENT)?;
+        }
+        if let Some(rate_limiter) = &self.net.tx_rate_limiter {
+            helper.add_event(rate_limiter.as_raw_fd(), TX_RATE_LIMITER_EVENT)?;
+        }
+
+        let mem = self.mem.memory();
+        // If the guest has already posted RX buffers, start listening on the
+        // XSK fd immediately.
+        if self
+            .queue_pair
+            .0
+            .used_idx(mem.deref(), Ordering::Acquire)
+            .map_err(EpollHelperError::QueueRingIndex)?
+            < self
+                .queue_pair
+                .0
+                .avail_idx(mem.deref(), Ordering::Acquire)
+                .map_err(EpollHelperError::QueueRingIndex)?
+        {
+            helper.add_event(self.net.xsk.as_raw_fd(), XSK_RX_EVENT)?;
+            self.net.xsk_rx_listening = true;
+        }
+
+        self.net.epoll_fd = Some(helper.as_raw_fd());
+        helper.run(paused, paused_sync, self)?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "net_backend_af_xdp")]
+impl EpollHelperHandler for XdpNetEpollHandler {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
+        let ev_type = event.data as u16;
+        match ev_type {
+            RX_QUEUE_EVENT => {
+                self.handle_rx_event().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Error processing RX queue: {e:?}"))
+                })?;
+            }
+            TX_QUEUE_EVENT => {
+                let queue_evt = &self.queue_evt_pair.1;
+                if let Err(e) = queue_evt.read() {
+                    error!("Failed to get tx queue event: {e:?}");
+                }
+                self.handle_tx_event().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Error processing TX queue: {e:?}"))
+                })?;
+            }
+            XSK_RX_EVENT => {
+                self.handle_xsk_rx_event().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Error processing XSK queue: {e:?}"))
+                })?;
+            }
+            RX_RATE_LIMITER_EVENT => {
+                if let Some(rate_limiter) = &mut self.net.rx_rate_limiter {
+                    rate_limiter.event_handler().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Error from 'rate_limiter.event_handler()': {e:?}"
+                        ))
+                    })?;
+
+                    if !self.net.xsk_rx_listening && self.net.rx_desc_avail {
+                        self.net.register_rx_listener().map_err(|e| {
+                            EpollHelperError::HandleEvent(anyhow!(
+                                "Error register_listener with `RX_RATE_LIMITER_EVENT`: {e:?}"
+                            ))
+                        })?;
+                    }
+                } else {
+                    return Err(EpollHelperError::HandleEvent(anyhow!(
+                        "Unexpected RX_RATE_LIMITER_EVENT"
+                    )));
+                }
+            }
+            TX_RATE_LIMITER_EVENT => {
+                if let Some(rate_limiter) = &mut self.net.tx_rate_limiter {
+                    rate_limiter.event_handler().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Error from 'rate_limiter.event_handler()': {e:?}"
+                        ))
+                    })?;
+                    self.process_tx().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!("Error processing TX queue: {e:?}"))
+                    })?;
+                } else {
+                    return Err(EpollHelperError::HandleEvent(anyhow!(
+                        "Unexpected TX_RATE_LIMITER_EVENT"
+                    )));
+                }
+            }
+            _ => {
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unexpected event: {ev_type}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Configuration for the in-process AF_XDP backend.
+///
+/// One AF_XDP socket is bound per NIC hardware queue at device-creation time;
+/// the queue ids used are `0..num_queue_pairs`, so the interface must expose
+/// that many combined queues (`ethtool -L <iface> combined N`).
+#[derive(Clone)]
+pub struct XdpBackendConfig {
+    /// Host interface AF_XDP binds to.
+    pub iface: String,
+    /// Peer interface of a `veth` pair. When set, a pass-through XDP program is
+    /// attached to it so AF_XDP redirect works (veth needs XDP on both ends).
+    pub peer: Option<String>,
+    /// Force the XDP redirect program to attach in generic (SKB) mode rather
+    /// than native driver mode. Required on `veth` and similar interfaces.
+    pub skb_mode: bool,
+    /// Request zero-copy mode at bind time.
+    pub zerocopy: bool,
+}
+
 pub struct Net {
     common: VirtioCommon,
     id: String,
@@ -404,6 +647,22 @@ pub struct Net {
     rate_limiter_config: Option<RateLimiterConfig>,
     exit_evt: EventFd,
     device_status: Arc<AtomicU8>,
+    /// `Some` when this device uses the AF_XDP backend instead of a TAP.
+    xdp: Option<XdpBackendConfig>,
+    /// The loaded XDP redirect program and its `xsks_map`, built eagerly at
+    /// device creation (`new_with_xdp`) while privileged capabilities are still
+    /// held. Kept alive for the device's lifetime so the program stays attached;
+    /// dropped (detaching the program) when the device goes away.
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[expect(
+        dead_code,
+        reason = "RAII guard; keeps the XDP program attached and xsks_map alive"
+    )]
+    xdp_program: Option<XdpProgram>,
+    /// Pre-built, map-registered AF_XDP sockets, one per queue pair. Taken by
+    /// `activate_xdp` and moved into the worker threads.
+    #[cfg(feature = "net_backend_af_xdp")]
+    xsks: Option<Vec<Xsk>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -523,6 +782,11 @@ impl Net {
             rate_limiter_config,
             exit_evt,
             device_status: Arc::new(AtomicU8::new(0)),
+            xdp: None,
+            #[cfg(feature = "net_backend_af_xdp")]
+            xdp_program: None,
+            #[cfg(feature = "net_backend_af_xdp")]
+            xsks: None,
         })
     }
 
@@ -629,6 +893,264 @@ impl Net {
         )
     }
 
+    /// Create a new virtio network device backed by AF_XDP sockets.
+    ///
+    /// Unlike the TAP path, AF_XDP delivers raw L2 frames with no offloads, so
+    /// no checksum/TSO/UFO features are advertised. The control queue (and thus
+    /// multi-queue) is only advertised when more than one queue pair is
+    /// configured, since single-queue needs no queue-count negotiation.
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[expect(clippy::too_many_arguments)]
+    pub fn new_with_xdp(
+        id: String,
+        xdp: XdpBackendConfig,
+        guest_mac: Option<MacAddr>,
+        mtu: Option<u16>,
+        access_platform_enabled: bool,
+        num_queues: usize,
+        queue_size: u16,
+        seccomp_action: SeccompAction,
+        rate_limiter_config: Option<RateLimiterConfig>,
+        exit_evt: EventFd,
+        state: Option<NetState>,
+    ) -> Result<Self> {
+        let num_queue_pairs = num_queues / 2;
+        let multi_queue = num_queue_pairs > 1;
+
+        // Prefer an explicit MTU; otherwise query the bound interface.
+        let mtu = mtu.or_else(|| match iface_mtu(&xdp.iface) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                warn!("Failed to query AF_XDP iface MTU; not advertising VIRTIO_NET_F_MTU: {e}");
+                None
+            }
+        });
+
+        let (avail_features, acked_features, config, queue_sizes, paused) =
+            if let Some(state) = state {
+                info!("Restoring virtio-net (AF_XDP) {id}");
+                (
+                    state.avail_features,
+                    state.acked_features,
+                    state.config,
+                    state.queue_size,
+                    true,
+                )
+            } else {
+                let mut avail_features = (1 << VIRTIO_RING_F_EVENT_IDX) | (1 << VIRTIO_F_VERSION_1);
+
+                if mtu.is_some() {
+                    avail_features |= 1 << VIRTIO_NET_F_MTU;
+                }
+                if access_platform_enabled {
+                    avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+                }
+
+                // No VIRTIO_NET_F_*_CSUM / TSO / UFO: AF_XDP is raw L2 with no
+                // offloads. Multi-queue needs the control queue to negotiate the
+                // queue count; single-queue advertises neither.
+                let mut config = VirtioNetConfig::default();
+                if let Some(mac) = guest_mac {
+                    config.mac.copy_from_slice(mac.get_bytes());
+                    avail_features |= 1 << VIRTIO_NET_F_MAC;
+                }
+                if let Some(mtu) = mtu {
+                    config.mtu = mtu;
+                }
+                if multi_queue {
+                    config.max_virtqueue_pairs = num_queue_pairs as u16;
+                    avail_features |= (1 << VIRTIO_NET_F_MQ) | (1 << VIRTIO_NET_F_CTRL_VQ);
+                }
+
+                // One queue per RX/TX virtqueue, plus the control queue when MQ is on.
+                let queue_num = num_queues + usize::from(multi_queue);
+
+                (
+                    avail_features,
+                    0,
+                    config,
+                    vec![queue_size; queue_num],
+                    false,
+                )
+            };
+
+        // Build the datapath eagerly, while the vmm thread still holds
+        // CAP_BPF/CAP_NET_ADMIN (capabilities are dropped later, in `Vm::boot`).
+        // We load and attach the redirect program, then bind one XSK per queue
+        // pair and register it in `xsks_map[queue_id]`. `activate_xdp` later just
+        // moves the pre-built sockets into the worker threads.
+        let ifindex = iface_index(&xdp.iface).map_err(|e| Error::Xdp(Box::new(e)))?;
+        let attach_mode = if xdp.skb_mode {
+            XdpAttachMode::Skb
+        } else {
+            XdpAttachMode::Auto
+        };
+        let mut xdp_program =
+            XdpProgram::load_and_attach(&xdp.iface, xdp.peer.as_deref(), attach_mode)
+                .map_err(|e| Error::XdpProgram(Box::new(e)))?;
+
+        let socket_config = XdpSocketConfig {
+            zerocopy: xdp.zerocopy,
+            ..Default::default()
+        };
+        let mut xsks = Vec::with_capacity(num_queue_pairs);
+        for queue_id in 0..num_queue_pairs as u32 {
+            let xsk =
+                Xsk::new(ifindex, queue_id, socket_config).map_err(|e| Error::Xdp(Box::new(e)))?;
+            xdp_program
+                .insert_xsk(queue_id, &xsk)
+                .map_err(|e| Error::XdpProgram(Box::new(e)))?;
+            xsks.push(xsk);
+        }
+
+        Ok(Net {
+            common: VirtioCommon {
+                device_type: VirtioDeviceType::Net as u32,
+                avail_features,
+                acked_features,
+                queue_sizes,
+                paused_sync: Some(Arc::new(Barrier::new(num_queue_pairs + 1))),
+                min_queues: 2,
+                paused: Arc::new(AtomicBool::new(paused)),
+                ..Default::default()
+            },
+            id,
+            taps: Vec::new(),
+            config,
+            counters: NetCounters::default(),
+            seccomp_action,
+            rate_limiter_config,
+            exit_evt,
+            device_status: Arc::new(AtomicU8::new(0)),
+            xdp: Some(xdp),
+            xdp_program: Some(xdp_program),
+            xsks: Some(xsks),
+        })
+    }
+
+    /// Activation path for the AF_XDP backend. Moves the XSKs built in
+    /// `new_with_xdp` (and already registered in `xsks_map`) into one worker
+    /// thread per queue pair. No privileged operation happens here, so it works
+    /// after CAP_BPF/CAP_NET_ADMIN have been dropped.
+    #[cfg(feature = "net_backend_af_xdp")]
+    fn activate_xdp(
+        &mut self,
+        mem: &GuestMemoryAtomic<GuestMemoryMmap>,
+        interrupt_cb: &Arc<dyn VirtioInterrupt>,
+        mut queues: Vec<(usize, Queue, EventFd)>,
+    ) -> ActivateResult {
+        let num_queues = queues.len();
+        let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
+
+        let has_ctrl_queue =
+            self.common.feature_acked(VIRTIO_NET_F_CTRL_VQ.into()) && !num_queues.is_multiple_of(2);
+        let ctrl_threads = if has_ctrl_queue { 1 } else { 0 };
+        let qp_threads = (num_queues - ctrl_threads) / 2;
+        self.common.paused_sync = Some(Arc::new(Barrier::new(1 + qp_threads + ctrl_threads)));
+
+        if has_ctrl_queue {
+            let ctrl_queue_index = num_queues - 1;
+            let (_, mut ctrl_queue, ctrl_queue_evt) = queues.remove(ctrl_queue_index);
+            ctrl_queue.set_event_idx(event_idx);
+
+            let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+            // Tap-less control queue: handles VIRTIO_NET_CTRL_MQ; there is no
+            // tap to reprogram for offloads (none are advertised anyway).
+            let mut ctrl_handler = NetCtrlEpollHandler {
+                mem: mem.clone(),
+                kill_evt,
+                pause_evt,
+                ctrl_q: CtrlQueue::new_without_tap(),
+                queue: ctrl_queue,
+                queue_evt: ctrl_queue_evt,
+                access_platform: self.common.access_platform(),
+                queue_index: ctrl_queue_index as u16,
+                interrupt_cb: interrupt_cb.clone(),
+            };
+
+            let paused = self.common.paused.clone();
+            let paused_sync = self.common.paused_sync.clone();
+            self.common.spawn_worker(
+                &format!("{}_ctrl", self.id),
+                &self.seccomp_action,
+                Thread::VirtioNetCtl,
+                &self.exit_evt,
+                self.device_status.clone(),
+                interrupt_cb.clone(),
+                move || ctrl_handler.run_ctrl(&paused, paused_sync.as_ref().unwrap()),
+            )?;
+        }
+
+        // The XSKs were created and registered in `xsks_map` at device creation
+        // (`new_with_xdp`), while privileged capabilities were still held.
+        // Activation only moves them into the per-queue-pair worker threads.
+        let xsks = self.xsks.take().ok_or_else(|| {
+            error!("AF_XDP device activated without pre-built sockets");
+            ActivateError::BadActivate
+        })?;
+        let mut xsks = xsks.into_iter();
+
+        for i in 0..queues.len() / 2 {
+            let xsk = xsks.next().ok_or_else(|| {
+                error!("AF_XDP device has fewer sockets than queue pairs");
+                ActivateError::BadActivate
+            })?;
+
+            let (_, queue_0, queue_evt_0) = queues.remove(0);
+            let (_, queue_1, queue_evt_1) = queues.remove(0);
+            let mut queue_pair = (queue_0, queue_1);
+            queue_pair.0.set_event_idx(event_idx);
+            queue_pair.1.set_event_idx(event_idx);
+            let queue_evt_pair = (queue_evt_0, queue_evt_1);
+
+            let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+
+            let rx_rate_limiter: Option<rate_limiter::RateLimiter> = self
+                .rate_limiter_config
+                .map(RateLimiterConfig::try_into)
+                .transpose()
+                .map_err(ActivateError::CreateRateLimiter)?;
+            let tx_rate_limiter: Option<rate_limiter::RateLimiter> = self
+                .rate_limiter_config
+                .map(RateLimiterConfig::try_into)
+                .transpose()
+                .map_err(ActivateError::CreateRateLimiter)?;
+
+            let mut handler = XdpNetEpollHandler {
+                net: XdpQueuePair::new(
+                    xsk,
+                    self.counters.clone(),
+                    XSK_RX_EVENT,
+                    rx_rate_limiter,
+                    tx_rate_limiter,
+                    self.common.access_platform(),
+                ),
+                mem: mem.clone(),
+                queue_index_base: (i * 2) as u16,
+                queue_pair,
+                queue_evt_pair,
+                interrupt_cb: interrupt_cb.clone(),
+                kill_evt,
+                pause_evt,
+            };
+
+            let paused = self.common.paused.clone();
+            let paused_sync = self.common.paused_sync.clone();
+            self.common.spawn_worker(
+                &format!("{}_xdp_qp{i}", self.id.clone()),
+                &self.seccomp_action,
+                Thread::VirtioNetAfXdp,
+                &self.exit_evt,
+                self.device_status.clone(),
+                interrupt_cb.clone(),
+                move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            )?;
+        }
+
+        event!("virtio-device", "activated", "id", &self.id);
+        Ok(())
+    }
+
     fn state(&self) -> NetState {
         NetState {
             avail_features: self.common.avail_features,
@@ -674,6 +1196,17 @@ impl VirtioDevice for Net {
         } = context;
         self.device_status = device_status;
         self.common.activate(&queues, interrupt_cb.clone())?;
+
+        if self.xdp.is_some() {
+            // The AF_XDP backend reuses the epoll/thread machinery but a wholly
+            // separate copy core; see `activate_xdp`. Validation refuses
+            // `backend=xdp` when the feature is absent, so this is unreachable
+            // without it.
+            #[cfg(feature = "net_backend_af_xdp")]
+            return self.activate_xdp(&mem, &interrupt_cb, queues);
+            #[cfg(not(feature = "net_backend_af_xdp"))]
+            return Err(ActivateError::BadActivate);
+        }
 
         let num_queues = queues.len();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
@@ -855,4 +1388,16 @@ impl Snapshottable for Net {
     }
 }
 impl Transportable for Net {}
-impl Migratable for Net {}
+impl Migratable for Net {
+    fn start_migration(&mut self) -> std::result::Result<(), MigratableError> {
+        // Cold snapshot/restore works for AF_XDP (the destination rebuilds the
+        // XSK from NetConfig), but live migration cannot transfer in-flight ring
+        // state or the kernel-attached XDP program.
+        if self.xdp.is_some() {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "the AF_XDP network backend does not support live migration"
+            )));
+        }
+        Ok(())
+    }
+}

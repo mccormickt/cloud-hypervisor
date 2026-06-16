@@ -121,10 +121,17 @@ use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 use crate::vm_config::IvshmemConfig;
 use crate::vm_config::{
     ConsoleOutputMode, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PciDeviceCommonConfig,
-    PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetBackend, NetConfig,
+    PciDeviceCommonConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig,
+    VsockConfig,
 };
 use crate::{DEVICE_MANAGER_SNAPSHOT_ID, GuestRegionMmap, PciDeviceInfo, device_node};
+
+/// A constructed virtio device paired with its migratable handle.
+type VirtioDevicePair = (
+    Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
+    Arc<Mutex<dyn Migratable>>,
+);
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const MMIO_LEN: u64 = 0x1000;
@@ -184,6 +191,10 @@ pub enum DeviceManagerError {
     /// Cannot create virtio-net device
     #[error("Cannot create virtio-net device")]
     CreateVirtioNet(#[source] virtio_devices::net::Error),
+
+    /// AF_XDP backend requested but the feature is not compiled in
+    #[error("AF_XDP network backend requires the \"net_backend_af_xdp\" build feature")]
+    AfXdpFeatureDisabled,
 
     /// Cannot create virtio-console device
     #[error("Cannot create virtio-console device")]
@@ -2927,7 +2938,9 @@ impl DeviceManager {
         };
         info!("Creating virtio-net device: {net_cfg:?}");
 
-        let (virtio_device, migratable_device) = if net_cfg.vhost_user {
+        let (virtio_device, migratable_device) = if matches!(net_cfg.backend, NetBackend::AfXdp) {
+            self.make_virtio_net_af_xdp_device(net_cfg, &id, snapshot)?
+        } else if net_cfg.vhost_user {
             let socket = net_cfg.vhost_socket.as_ref().unwrap().clone();
             let vu_cfg = VhostUserConfig {
                 socket,
@@ -3067,6 +3080,65 @@ impl DeviceManager {
             pci_common: net_cfg.pci_common.clone(),
             dma_handler: None,
         })
+    }
+
+    /// Build a virtio-net device backed by the in-process AF_XDP backend.
+    ///
+    /// Returns an error when CH was built without the `net_backend_af_xdp`
+    /// feature; `NetConfig::validate` rejects `backend=xdp` in that case, so
+    /// this is unreachable without the feature.
+    #[cfg(not(feature = "net_backend_af_xdp"))]
+    fn make_virtio_net_af_xdp_device(
+        &self,
+        _net_cfg: &NetConfig,
+        _id: &str,
+        _snapshot: Option<&Snapshot>,
+    ) -> DeviceManagerResult<VirtioDevicePair> {
+        Err(DeviceManagerError::AfXdpFeatureDisabled)
+    }
+
+    #[cfg(feature = "net_backend_af_xdp")]
+    fn make_virtio_net_af_xdp_device(
+        &self,
+        net_cfg: &NetConfig,
+        id: &str,
+        snapshot: Option<&Snapshot>,
+    ) -> DeviceManagerResult<VirtioDevicePair> {
+        let state = state_from_id(snapshot, id).map_err(DeviceManagerError::RestoreGetState)?;
+
+        // `validate` guarantees `xdp_iface` is present for the AF_XDP backend.
+        let xdp_cfg = virtio_devices::net::XdpBackendConfig {
+            iface: net_cfg
+                .xdp_iface
+                .clone()
+                .expect("xdp_iface validated present"),
+            peer: net_cfg.xdp_peer.clone(),
+            skb_mode: net_cfg.xdp_skb,
+            zerocopy: net_cfg.xdp_zerocopy,
+        };
+
+        let net = virtio_devices::Net::new_with_xdp(
+            id.to_string(),
+            xdp_cfg,
+            Some(net_cfg.mac),
+            net_cfg.mtu,
+            self.force_access_platform | net_cfg.pci_common.iommu,
+            net_cfg.num_queues,
+            net_cfg.queue_size,
+            self.seccomp_action.clone(),
+            net_cfg.rate_limiter_config,
+            self.exit_evt
+                .try_clone()
+                .map_err(DeviceManagerError::EventFd)?,
+            state,
+        )
+        .map_err(DeviceManagerError::CreateVirtioNet)?;
+
+        let net = Arc::new(Mutex::new(net));
+        Ok((
+            Arc::clone(&net) as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
+            net as Arc<Mutex<dyn Migratable>>,
+        ))
     }
 
     /// Add virto-net and vhost-user-net devices

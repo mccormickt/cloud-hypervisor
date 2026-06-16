@@ -633,7 +633,18 @@ fn vmm_thread_rules(
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_arch_prctl, vec![]),
         (libc::SYS_bind, vec![]),
+        // AF_XDP: bpf() loads the XDP redirect program and creates/populates
+        // xsks_map at device creation; returns EPERM once CAP_BPF is dropped at
+        // boot, so it is only needed transiently.
+        #[cfg(feature = "net_backend_af_xdp")]
+        (libc::SYS_bpf, vec![]),
         (libc::SYS_brk, vec![]),
+        // AF_XDP: capget/capset drop CAP_BPF and CAP_NET_ADMIN at boot, before
+        // the vCPU threads are spawned.
+        #[cfg(feature = "net_backend_af_xdp")]
+        (libc::SYS_capget, vec![]),
+        #[cfg(feature = "net_backend_af_xdp")]
+        (libc::SYS_capset, vec![]),
         (libc::SYS_clock_gettime, vec![]),
         (libc::SYS_clock_nanosleep, vec![]),
         (libc::SYS_clone, vec![]),
@@ -668,6 +679,9 @@ fn vmm_thread_rules(
         (libc::SYS_getpgrp, vec![]),
         (libc::SYS_getpid, vec![]),
         (libc::SYS_getrandom, vec![]),
+        // Reading XDP_MMAP_OFFSETS when binding AF_XDP sockets at device
+        // activation; harmless for other backends.
+        (libc::SYS_getsockopt, vec![]),
         (libc::SYS_gettid, vec![]),
         (libc::SYS_gettimeofday, vec![]),
         (libc::SYS_getuid, vec![]),
@@ -736,12 +750,27 @@ fn vmm_thread_rules(
         (libc::SYS_setsockopt, vec![]),
         (libc::SYS_shutdown, vec![]),
         (libc::SYS_sigaltstack, vec![]),
+        #[cfg(not(feature = "net_backend_af_xdp"))]
         (
             libc::SYS_socket,
             or![
                 and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_UNIX as u64)?],
                 and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_INET as u64)?],
                 and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_INET6 as u64)?],
+            ],
+        ),
+        // AF_XDP: creating an XSK at device creation needs `socket(AF_XDP)`, and
+        // attaching the redirect program in SKB mode may use the netlink
+        // (`AF_NETLINK`) fallback when `bpf_link_create` does not take the mode.
+        #[cfg(feature = "net_backend_af_xdp")]
+        (
+            libc::SYS_socket,
+            or![
+                and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_UNIX as u64)?],
+                and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_INET as u64)?],
+                and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_INET6 as u64)?],
+                and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_XDP as u64)?],
+                and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_NETLINK as u64)?],
             ],
         ),
         (libc::SYS_socketpair, vec![]),
@@ -757,6 +786,10 @@ fn vmm_thread_rules(
             libc::SYS_umask,
             or![and![Cond::new(0, ArgLen::Dword, Eq, 0o077)?]],
         ),
+        // AF_XDP: aya probes the running kernel version via uname() during
+        // program load.
+        #[cfg(feature = "net_backend_af_xdp")]
+        (libc::SYS_uname, vec![]),
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_unlink, vec![]),
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]

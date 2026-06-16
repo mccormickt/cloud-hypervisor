@@ -5,11 +5,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+#[cfg(feature = "net_backend_af_xdp")]
+mod bpf;
 mod ctrl_queue;
 mod mac;
 mod open_tap;
 mod queue_pair;
 mod tap;
+#[cfg(feature = "net_backend_af_xdp")]
+mod xdp_queue_pair;
+#[cfg(feature = "net_backend_af_xdp")]
+mod xsk;
 
 use std::io::Error as IoError;
 use std::net::IpAddr;
@@ -29,11 +35,17 @@ use vm_memory::bitmap::AtomicBitmap;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 
+#[cfg(feature = "net_backend_af_xdp")]
+pub use bpf::{XdpAttachMode, XdpProgram, XdpProgramError};
 pub use ctrl_queue::{CtrlQueue, Error as CtrlQueueError};
 pub use mac::{MAC_ADDR_LEN, MacAddr};
 pub use open_tap::{Error as OpenTapError, open_tap};
 pub use queue_pair::{NetCounters, NetQueuePair, NetQueuePairError, RxVirtio, TxVirtio};
 pub use tap::{Error as TapError, Tap};
+#[cfg(feature = "net_backend_af_xdp")]
+pub use xdp_queue_pair::{XdpQueuePair, XdpQueuePairError};
+#[cfg(feature = "net_backend_af_xdp")]
+pub use xsk::{XdpError, XdpSocketConfig, Xsk, iface_index, iface_mtu};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -104,6 +116,16 @@ fn create_unix_socket() -> Result<net::UdpSocket> {
 fn vnet_hdr_len() -> usize {
     mem::size_of::<virtio_net_hdr_v1>()
 }
+
+/// AF_XDP UMEM frame size in aligned-chunk mode. Must be a power of two no
+/// larger than the page size; one whole L2 frame is carried per UMEM frame.
+pub const XDP_FRAME_SIZE: u32 = 4096;
+
+/// Maximum guest MTU supported by the AF_XDP backend. A full L2 frame — the
+/// 14-byte Ethernet header plus the L3 payload — must fit in a single UMEM
+/// frame, so the MTU is bounded by `XDP_FRAME_SIZE - ETH_HLEN`. Jumbo frames
+/// (which would need multi-frame or unaligned chunks) are unsupported.
+pub const XDP_MAX_MTU: u16 = XDP_FRAME_SIZE as u16 - 14;
 
 pub fn register_listener(
     epoll_fd: RawFd,

@@ -1,0 +1,7 @@
+# eBPF compilation requires nightly (for `-Z build-std=core`) and the
+# `rust-src` component. `bpf-linker` must also be installed (`cargo install
+# bpf-linker`). Only needed when building `net_util` with the
+# `net_backend_af_xdp` feature.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]

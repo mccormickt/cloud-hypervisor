@@ -14,6 +14,10 @@ inherits = "release"
 strip = false
 
 [workspace]
+# The eBPF crate targets `bpfel-unknown-none` with `-Z build-std` on nightly and
+# is built out-of-band by `net_util`'s feature-gated `build.rs`, so it cannot be
+# a normal workspace member (it would break default host builds).
+exclude = ["net_util/xdp-ebpf"]
 members = [
   "api_client",
   "arch",

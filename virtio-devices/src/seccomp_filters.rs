@@ -20,6 +20,8 @@ pub enum Thread {
     VirtioIommu,
     VirtioMem,
     VirtioNet,
+    #[cfg(feature = "net_backend_af_xdp")]
+    VirtioNetAfXdp,
     VirtioNetCtl,
     VirtioPmem,
     VirtioRng,
@@ -172,6 +174,17 @@ fn virtio_net_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     ]
 }
 
+// The AF_XDP worker drives the rings with `sendto` (TX kick) and `recvfrom`
+// (RX wake-up); the UMEM/ring mmaps and epoll syscalls are already covered by
+// `virtio_thread_common`. It issues no `bpf()` — the supervisor owns those.
+#[cfg(feature = "net_backend_af_xdp")]
+fn virtio_net_af_xdp_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+    let mut rules = virtio_net_thread_rules();
+    rules.push((libc::SYS_sendto, vec![]));
+    rules.push((libc::SYS_recvfrom, vec![]));
+    rules
+}
+
 fn create_virtio_net_ctl_ioctl_seccomp_rule() -> Vec<SeccompRule> {
     or![
         and![Cond::new(1, ArgLen::Dword, Eq, TUNSETOFFLOAD as _).unwrap()],
@@ -314,6 +327,8 @@ fn get_seccomp_rules(thread_type: Thread) -> Vec<(i64, Vec<SeccompRule>)> {
         Thread::VirtioIommu => virtio_iommu_thread_rules(),
         Thread::VirtioMem => virtio_mem_thread_rules(),
         Thread::VirtioNet => virtio_net_thread_rules(),
+        #[cfg(feature = "net_backend_af_xdp")]
+        Thread::VirtioNetAfXdp => virtio_net_af_xdp_thread_rules(),
         Thread::VirtioNetCtl => virtio_net_ctl_thread_rules(),
         Thread::VirtioPmem => virtio_pmem_thread_rules(),
         Thread::VirtioRng => virtio_rng_thread_rules(),
