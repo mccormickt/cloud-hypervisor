@@ -134,11 +134,11 @@ impl Drop for MmapRegion {
 /// `[fill_size, fill_size + tx_size)` form the TX pool (handed to the TX ring
 /// and reclaimed via the COMPLETION ring).
 pub struct Xsk {
-    // `socket` must be declared before `umem_mem`: it owns the registered UMEM
+    // `socket` must be declared before `_umem_mem`: it owns the registered UMEM
     // and must be dropped (closing the fd and unmapping the rings) before the
     // backing memory is unmapped.
     socket: XskSocket,
-    umem_mem: MmapRegion,
+    _umem_mem: MmapRegion,
     frame_size: u32,
     /// Frames published to the kernel and not yet released from RX.
     rx_published: Vec<bool>,
@@ -202,7 +202,7 @@ impl Xsk {
 
         Ok(Self {
             socket,
-            umem_mem,
+            _umem_mem: umem_mem,
             frame_size,
             rx_published,
             rx_pool,
@@ -221,24 +221,21 @@ impl Xsk {
     }
 
     /// The bytes of the `index`-th available received packet (raw L2 frame).
-    pub fn rx_peek(&self, index: u32) -> Option<&[u8]> {
-        self.socket.rx_peek(index)
+    pub fn rx_peek(&self, index: u32) -> Result<&[u8], XdpError> {
+        self.socket
+            .rx_frame(index)?
+            .map(|frame| frame.data)
+            .ok_or(XdpError::InvalidRxFrame)
     }
 
     /// Releases the `n` oldest received descriptors and recycles their frames
     /// into the RX pool for later refilling.
     pub fn rx_release(&mut self, n: u32) -> Result<(), XdpError> {
         for _ in 0..n {
-            let packet = self.socket.rx_peek(0).ok_or(XdpError::InvalidRxFrame)?;
-            // Aya's slice points at the descriptor's packet start. Only its
-            // address is inspected here; the backing mapping is not aliased.
-            // Aligned chunks can contain headroom, so round down to the frame.
-            let index = rx_frame_index(
-                self.umem_mem.ptr.as_ptr().addr(),
-                self.frame_size,
-                &mut self.rx_published,
-                packet,
-            )?;
+            let frame = self.socket.rx_frame(0)?.ok_or(XdpError::InvalidRxFrame)?;
+            // Aya validates descriptor bounds and normalizes the frame address.
+            // The device tracks which RX frames were published to the kernel.
+            let index = rx_frame_index(frame.frame_addr, self.frame_size, &mut self.rx_published)?;
             self.socket.rx_release(1);
             self.rx_pool.push(index);
             self.rx_wake_deadline = None;
@@ -270,8 +267,8 @@ impl Xsk {
     }
 
     /// Schedule bounded wake retries after publication or worker restart.
-    /// Aya masks transient wake errors, so an empty pool does not prove that
-    /// the driver is awake. RX progress or the deadline ends this retry window.
+    /// A successful wake does not prove ring progress. RX progress or the
+    /// deadline ends this retry window.
     pub fn retry_rx_wakeup(&mut self) {
         if self.zerocopy {
             self.rx_wake_deadline = Some(Instant::now() + RX_WAKE_RETRY_WINDOW);
@@ -335,22 +332,13 @@ impl AsRawFd for Xsk {
 }
 
 fn rx_frame_index(
-    base: usize,
+    frame_addr: u64,
     frame_size: u32,
     published: &mut [bool],
-    packet: &[u8],
 ) -> Result<u32, XdpError> {
-    let offset = packet
-        .as_ptr()
-        .addr()
-        .checked_sub(base)
-        .ok_or(XdpError::InvalidRxFrame)?;
-    let frame_size = frame_size as usize;
-    let index = offset / frame_size;
-    if index >= published.len()
-        || packet.len() > frame_size - offset % frame_size
-        || !published[index]
-    {
+    let index = usize::try_from(frame_addr / u64::from(frame_size))
+        .map_err(|_| XdpError::InvalidRxFrame)?;
+    if index >= published.len() || !published[index] {
         return Err(XdpError::InvalidRxFrame);
     }
     published[index] = false;
@@ -442,21 +430,18 @@ mod tests {
     }
 
     #[test]
-    fn rx_frame_identity_follows_packet_address_not_fill_order() {
-        let memory = vec![0u8; 4096 * 4];
-        let base = memory.as_ptr().addr();
+    fn rx_frame_identity_follows_descriptor_not_fill_order() {
         let mut published = [true; 3];
         for index in [2, 0, 1] {
-            let start = index * 4096 + 256;
             assert_eq!(
-                rx_frame_index(base, 4096, &mut published, &memory[start..start + 60]).unwrap(),
+                rx_frame_index(index * 4096, 4096, &mut published).unwrap(),
                 index as u32,
             );
         }
-        rx_frame_index(base, 4096, &mut published, &memory[2 * 4096..2 * 4096 + 60]).unwrap_err();
+        rx_frame_index(2 * 4096, 4096, &mut published).unwrap_err();
         published.fill(true);
-        rx_frame_index(base, 4096, &mut published, &memory[3 * 4096..]).unwrap_err();
-        rx_frame_index(base, 4096, &mut published, &memory[4090..4100]).unwrap_err();
-        rx_frame_index(base + 1, 4096, &mut published, &memory[..60]).unwrap_err();
+        rx_frame_index(3 * 4096, 4096, &mut published).unwrap_err();
+        rx_frame_index(u64::MAX, 4096, &mut published).unwrap_err();
+        assert_eq!(published, [true; 3]);
     }
 }

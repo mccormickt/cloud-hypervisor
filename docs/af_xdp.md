@@ -9,7 +9,9 @@ bypassing the kernel network stack for higher packet rates.
 This backend is built behind the `net_backend_af_xdp` cargo feature, which is
 **off by default**. Building it compiles a small embedded eBPF redirect program,
 which needs a **nightly** toolchain (with `rust-src`) and
-[`bpf-linker`](https://github.com/aya-rs/bpf-linker):
+[`bpf-linker`](https://github.com/aya-rs/bpf-linker). The optional Aya dependencies
+require Rust 1.98 or newer for host code; the nightly below meets that requirement.
+Builds without this feature retain Cloud Hypervisor's Rust 1.89 minimum.
 
 ```bash
 rustup toolchain install nightly-2026-09-25 --component rust-src

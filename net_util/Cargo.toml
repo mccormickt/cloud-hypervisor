@@ -16,7 +16,7 @@ net_backend_af_xdp = ["dep:aya", "dep:aya-build"]
 # AF_XDP (XSK) datapath. Pure Rust, no C system dependencies. Pinned to the fork
 # branch that adds the `xsk` module until that work lands upstream in
 # `aya-rs/aya` and is published to crates.io.
-aya = { git = "https://github.com/mccormickt/aya", optional = true, rev = "27ffd32b89be2684906256187801fe46a75d1f40" }
+aya = { git = "https://github.com/mccormickt/aya", optional = true, rev = "c6205d8026bb526e46fa92692659ff0e59f0c9ac" }
 epoll = { workspace = true }
 getrandom = "0.4.2"
 libc = { workspace = true }
@@ -38,7 +38,7 @@ vmm-sys-util = { workspace = true }
 # Compiles the standalone `xdp-ebpf` crate to an embeddable object in `build.rs`.
 # Optional and only enabled by `net_backend_af_xdp`, so default builds need
 # neither nightly nor `bpf-linker`. Pinned to the same fork revision as `aya`.
-aya-build = { git = "https://github.com/mccormickt/aya", optional = true, rev = "27ffd32b89be2684906256187801fe46a75d1f40" }
+aya-build = { git = "https://github.com/mccormickt/aya", optional = true, rev = "c6205d8026bb526e46fa92692659ff0e59f0c9ac" }
 
 [dev-dependencies]
 pnet = "0.35.0"

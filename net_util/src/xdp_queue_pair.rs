@@ -340,11 +340,8 @@ impl<'a> XdpQueuePair<'a> {
                 }
             };
 
-            let payload_len = self
-                .xsk
-                .rx_peek(processed)
-                .map(|p| p.len())
-                .unwrap_or_default();
+            let payload = self.xsk.rx_peek(processed)?;
+            let payload_len = payload.len();
             let frame_len = header.len() + payload_len;
 
             let written = if payload_len == 0 || capacity < frame_len {
@@ -355,9 +352,6 @@ impl<'a> XdpQueuePair<'a> {
                 }
                 0
             } else {
-                // Re-peek to obtain the borrow for the copy; the immutable XSK
-                // borrow ends before any mutable XSK call below.
-                let payload = self.xsk.rx_peek(processed).expect("peeked above");
                 write_rx_frame(mem, &segments, &header, payload)?
             };
 

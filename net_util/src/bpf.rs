@@ -11,14 +11,15 @@
 //! `CAP_BPF`/`CAP_NET_ADMIN`; the map is populated before those capabilities are
 //! dropped, so the running guest never depends on `bpf()`.
 //!
-//! The `Ebpf` handle is kept alive for the device's lifetime: dropping it
-//! detaches the program and frees the map.
+//! The program, map, and FD-owned links stay alive for the device's lifetime.
+//! Closing the links detaches the programs without setup capabilities.
 
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 
 use aya::maps::{MapData, MapError, XskMap};
-use aya::programs::{ProgramError, Xdp};
+use aya::programs::links::FdLink;
+use aya::programs::{ProgramError, Xdp, XdpMode};
 use aya::{Ebpf, EbpfLoader};
 use thiserror::Error;
 
@@ -69,16 +70,13 @@ pub enum XdpAttachMode {
 
 /// A loaded-and-attached XDP redirect program plus its `xsks_map` handle.
 pub struct XdpProgram {
-    // Keeps the loaded program(s) and their attach links alive. Dropping this
-    // detaches the program(s) and unloads them. Must outlive the device.
+    // Keeps the loaded programs alive for the device's lifetime.
     _ebpf: Ebpf,
-    // Owned handle to the program's `xsks_map`. Inserting an XSK fd operates on
-    // this map fd and requires no privileged capability, so it stays usable
-    // after CAP_BPF is dropped.
+    // Populate the map before the VMM installs its BPF-denying filter.
     xsks_map: XskMap<MapData>,
     // Closing an FD-owned link detaches without CAP_NET_ADMIN.
-    _link: OwnedFd,
-    _pass_link: Option<OwnedFd>,
+    _link: FdLink,
+    _pass_link: Option<FdLink>,
 }
 
 impl XdpProgram {
@@ -148,52 +146,16 @@ impl XdpProgram {
 }
 
 /// Attaches `program` to `iface`, honoring [`XdpAttachMode`].
-fn attach(program: &mut Xdp, iface: &str, mode: XdpAttachMode) -> Result<OwnedFd, XdpProgramError> {
-    // Linux UAPI bpf_attr.link_create prefix. All optional fields are zero
-    // because the kernel zero-extends the supplied attribute size.
-    #[repr(C)]
-    struct LinkCreate {
-        prog_fd: u32,
-        target_ifindex: u32,
-        attach_type: u32,
-        flags: u32,
-    }
-    const BPF_LINK_CREATE: libc::c_uint = 28;
-    const BPF_XDP: u32 = 37;
-    const XDP_FLAGS_SKB_MODE: u32 = 1 << 1;
-
+fn attach(program: &Xdp, iface: &str, mode: XdpAttachMode) -> Result<FdLink, XdpProgramError> {
     let attach_err = |e| XdpProgramError::Attach(iface.to_owned(), e);
     let ifindex = crate::iface_index(iface).map_err(|e| attach_err(io::Error::other(e)))?;
-    let fd = program.fd().map_err(|e| attach_err(io::Error::other(e)))?;
-    let create = |flags| {
-        let attr = LinkCreate {
-            prog_fd: fd.as_fd().as_raw_fd() as u32,
-            target_ifindex: ifindex,
-            attach_type: BPF_XDP,
-            flags,
-        };
-        // SAFETY: attr matches the Linux UAPI prefix and is valid for the
-        // supplied size. A successful call returns a new owned descriptor.
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_bpf,
-                BPF_LINK_CREATE,
-                &attr,
-                size_of::<LinkCreate>(),
-            )
-        };
-        if result < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            // SAFETY: the successful syscall returned a new owned FD.
-            Ok(unsafe { OwnedFd::from_raw_fd(result as libc::c_int) })
-        }
-    };
     // Never use legacy netlink attachment: its cleanup requires capabilities
     // that the VMM drops before guest execution.
     match mode {
-        XdpAttachMode::Auto => create(0).or_else(|_| create(XDP_FLAGS_SKB_MODE)),
-        XdpAttachMode::Skb => create(XDP_FLAGS_SKB_MODE),
+        XdpAttachMode::Auto => program
+            .attach_to_if_index_fd(ifindex, XdpMode::Default)
+            .or_else(|_| program.attach_to_if_index_fd(ifindex, XdpMode::Skb)),
+        XdpAttachMode::Skb => program.attach_to_if_index_fd(ifindex, XdpMode::Skb),
     }
-    .map_err(attach_err)
+    .map_err(|e| attach_err(io::Error::other(e)))
 }
