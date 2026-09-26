@@ -142,9 +142,9 @@ pub const XDP_FRAME_SIZE: u32 = 4096;
 
 /// Maximum guest MTU supported by the AF_XDP backend. A full L2 frame — the
 /// 14-byte Ethernet header plus the L3 payload — must fit in a single UMEM
-/// frame, so the MTU is bounded by `XDP_FRAME_SIZE - ETH_HLEN`. Jumbo frames
-/// (which would need multi-frame or unaligned chunks) are unsupported.
-pub const XDP_MAX_MTU: u16 = XDP_FRAME_SIZE as u16 - 14;
+/// frame after the kernel's 256-byte XDP packet headroom. Jumbo frames are
+/// unsupported.
+pub const XDP_MAX_MTU: u16 = XDP_FRAME_SIZE as u16 - 256 - 14;
 
 pub fn register_listener(
     epoll_fd: RawFd,

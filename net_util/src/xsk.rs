@@ -18,10 +18,9 @@
 //! [`crate::bpf::XdpProgram::insert_xsk`] before the privileged capabilities are
 //! dropped, so the datapath never depends on `bpf()`.
 
-use std::collections::VecDeque;
-use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::{self, NonNull};
+use std::{io, mem};
 
 use aya::xsk::{XskError, XskSocket, XskSocketConfig, XskUmem, XskUmemConfig};
 use thiserror::Error;
@@ -44,6 +43,8 @@ pub enum XdpError {
     UnknownInterface(String),
     #[error("Failed to query interface")]
     Interface(#[source] io::Error),
+    #[error("RX descriptor is outside its UMEM frame pool")]
+    InvalidRxFrame,
 }
 
 /// Parameters for building an [`Xsk`].
@@ -136,18 +137,15 @@ pub struct Xsk {
     // and must be dropped (closing the fd and unmapping the rings) before the
     // backing memory is unmapped.
     socket: XskSocket,
-    // Held purely so its `Drop` munmaps the UMEM backing after `socket`.
-    #[expect(dead_code, reason = "RAII guard; unmaps the UMEM backing on drop")]
     umem_mem: MmapRegion,
     frame_size: u32,
-    /// RX frames currently published to the FILL ring, in submission order.
-    /// FILL is consumed and RX produced in the same order on a single queue, so
-    /// the i-th received packet corresponds to `fill_fifo[i]`.
-    fill_fifo: VecDeque<u32>,
+    /// Frames published to the kernel and not yet released from RX.
+    rx_published: Vec<bool>,
     /// RX frames the caller has reclaimed and not yet returned to FILL.
     rx_pool: Vec<u32>,
     /// Free TX frame indices.
     tx_free: Vec<u32>,
+    tx_inflight: u32,
 }
 
 // SAFETY: `Xsk` is moved to exactly one virtio worker thread and accessed only
@@ -194,17 +192,19 @@ impl Xsk {
         let tx_free: Vec<u32> = (config.fill_size..frame_count).collect();
 
         let submitted = socket.fill(rx_frames.iter().copied())? as usize;
-        let mut fill_fifo = VecDeque::with_capacity(rx_frames.len());
-        fill_fifo.extend(rx_frames[..submitted].iter().copied());
         let rx_pool = rx_frames[submitted..].to_vec();
+        let mut rx_published = vec![false; config.fill_size as usize];
+        rx_published[..submitted].fill(true);
+        socket.wake_rx()?;
 
         Ok(Self {
             socket,
             umem_mem,
             frame_size,
-            fill_fifo,
+            rx_published,
             rx_pool,
             tx_free,
+            tx_inflight: 0,
         })
     }
 
@@ -220,13 +220,22 @@ impl Xsk {
 
     /// Releases the `n` oldest received descriptors and recycles their frames
     /// into the RX pool for later refilling.
-    pub fn rx_release(&mut self, n: u32) {
+    pub fn rx_release(&mut self, n: u32) -> Result<(), XdpError> {
         for _ in 0..n {
-            if let Some(idx) = self.fill_fifo.pop_front() {
-                self.rx_pool.push(idx);
-            }
+            let packet = self.socket.rx_peek(0).ok_or(XdpError::InvalidRxFrame)?;
+            // Aya's slice points at the descriptor's packet start. Only its
+            // address is inspected here; the backing mapping is not aliased.
+            // Aligned chunks can contain headroom, so round down to the frame.
+            let index = rx_frame_index(
+                self.umem_mem.ptr.as_ptr().addr(),
+                self.frame_size,
+                &mut self.rx_published,
+                packet,
+            )?;
+            self.socket.rx_release(1);
+            self.rx_pool.push(index);
         }
-        self.socket.rx_release(n);
+        Ok(())
     }
 
     /// Returns reclaimed RX frames to the FILL ring and wakes the driver if
@@ -234,10 +243,16 @@ impl Xsk {
     pub fn refill(&mut self) -> Result<(), XdpError> {
         if !self.rx_pool.is_empty() {
             let submitted = self.socket.fill(self.rx_pool.iter().copied())? as usize;
-            self.fill_fifo.extend(self.rx_pool.drain(..submitted));
+            for index in self.rx_pool.drain(..submitted) {
+                self.rx_published[index as usize] = true;
+            }
         }
         self.socket.wake_rx()?;
         Ok(())
+    }
+
+    pub fn has_pending_refill(&self) -> bool {
+        !self.rx_pool.is_empty()
     }
 
     /// Reclaims completed TX frames back into the free pool.
@@ -249,7 +264,14 @@ impl Xsk {
             ..
         } = self;
         let frame_size = u64::from(*frame_size);
-        socket.complete(|addr| tx_free.push((addr / frame_size) as u32))
+        let completed = socket.complete(|addr| tx_free.push((addr / frame_size) as u32));
+        self.tx_inflight -= completed;
+        completed
+    }
+
+    /// Whether submitted frames still need completion and possibly a wakeup.
+    pub fn has_pending_tx(&self) -> bool {
+        self.tx_inflight != 0
     }
 
     /// Pops a free TX frame, returning its `(index, umem_addr)`.
@@ -271,7 +293,9 @@ impl Xsk {
 
     /// Enqueues one frame on the TX ring. Returns `false` if the ring was full.
     pub fn transmit(&mut self, addr: u64, len: u32) -> Result<bool, XdpError> {
-        Ok(self.socket.transmit([(addr, len)])? == 1)
+        let submitted = self.socket.transmit([(addr, len)])?;
+        self.tx_inflight += submitted;
+        Ok(submitted == 1)
     }
 
     /// Wakes the kernel to process the TX ring.
@@ -287,6 +311,29 @@ impl AsRawFd for Xsk {
     }
 }
 
+fn rx_frame_index(
+    base: usize,
+    frame_size: u32,
+    published: &mut [bool],
+    packet: &[u8],
+) -> Result<u32, XdpError> {
+    let offset = packet
+        .as_ptr()
+        .addr()
+        .checked_sub(base)
+        .ok_or(XdpError::InvalidRxFrame)?;
+    let frame_size = frame_size as usize;
+    let index = offset / frame_size;
+    if index >= published.len()
+        || packet.len() > frame_size - offset % frame_size
+        || !published[index]
+    {
+        return Err(XdpError::InvalidRxFrame);
+    }
+    published[index] = false;
+    Ok(index as u32)
+}
+
 /// Builds an `ifreq` with `ifr_name` set to `name` for an interface ioctl.
 fn ifreq_for(name: &str) -> Result<libc::ifreq, XdpError> {
     let name_bytes = name.as_bytes();
@@ -294,7 +341,7 @@ fn ifreq_for(name: &str) -> Result<libc::ifreq, XdpError> {
         return Err(XdpError::UnknownInterface(name.to_string()));
     }
     // SAFETY: `ifreq` is plain integer/array fields, so a zeroed value is valid.
-    let mut ifreq: libc::ifreq = unsafe { std::mem::zeroed() };
+    let mut ifreq: libc::ifreq = unsafe { mem::zeroed() };
     for (dst, src) in ifreq.ifr_name.iter_mut().zip(name_bytes) {
         *dst = *src as libc::c_char;
     }
@@ -338,5 +385,30 @@ pub fn iface_mtu(name: &str) -> Result<u16, XdpError> {
     }
     // SAFETY: the ioctl succeeded and populated the `ifru_mtu` union field.
     let mtu = unsafe { ifreq.ifr_ifru.ifru_mtu };
-    Ok(mtu as u16)
+    u16::try_from(mtu)
+        .map_err(|_| XdpError::Interface(io::Error::other("interface MTU exceeds u16")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rx_frame_identity_follows_packet_address_not_fill_order() {
+        let memory = vec![0u8; 4096 * 4];
+        let base = memory.as_ptr().addr();
+        let mut published = [true; 3];
+        for index in [2, 0, 1] {
+            let start = index * 4096 + 256;
+            assert_eq!(
+                rx_frame_index(base, 4096, &mut published, &memory[start..start + 60]).unwrap(),
+                index as u32,
+            );
+        }
+        rx_frame_index(base, 4096, &mut published, &memory[2 * 4096..2 * 4096 + 60]).unwrap_err();
+        published.fill(true);
+        rx_frame_index(base, 4096, &mut published, &memory[3 * 4096..]).unwrap_err();
+        rx_frame_index(base, 4096, &mut published, &memory[4090..4100]).unwrap_err();
+        rx_frame_index(base + 1, 4096, &mut published, &memory[..60]).unwrap_err();
+    }
 }

@@ -6,10 +6,9 @@
 //!
 //! The AF_XDP backend loads its XDP redirect program and populates `xsks_map`
 //! during device creation (`Vm::new`), which needs `CAP_BPF` and
-//! `CAP_NET_ADMIN`. After that the running guest's datapath only needs
-//! `CAP_NET_RAW`. [`drop_xdp_caps`] removes `CAP_BPF` and `CAP_NET_ADMIN` from
-//! the calling thread before the vCPU/worker threads are spawned, so those
-//! guest-facing threads inherit the reduced capability set.
+//! `CAP_NET_ADMIN`. Socket creation also needs `CAP_NET_RAW`. The bound
+//! datapath needs none of these capabilities. [`drop_xdp_caps`] removes setup
+//! authority before vCPU/worker threads start, including during restore.
 //!
 //! Capabilities are per-thread on Linux. This drops them on the current (vmm)
 //! thread only; threads spawned afterwards inherit the reduced set, but
@@ -20,13 +19,23 @@
 //! crate dependency. The libc version in use does not expose the capability
 //! structs, so they are declared here.
 
+use std::cell::Cell;
 use std::io;
+
+use seccompiler::{SeccompAction, SeccompFilter, apply_filter};
+
+thread_local! {
+    static BPF_RESTRICTED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// `CAP_NET_ADMIN` from `<linux/capability.h>`. Dropped (used for BPF/XDP
 /// program attach).
 const CAP_NET_ADMIN: u32 = 12;
 /// `CAP_BPF` from `<linux/capability.h>`. Dropped (used for `bpf()` syscalls).
 const CAP_BPF: u32 = 39;
+const CAP_NET_RAW: u32 = 13;
+const CAP_SYS_ADMIN: u32 = 21;
+const CAP_SETPCAP: u32 = 8;
 
 /// `_LINUX_CAPABILITY_VERSION_3`: 64-bit capabilities in two 32-bit words.
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -34,8 +43,13 @@ const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const LINUX_CAPABILITY_U32S_3: usize = 2;
 
 /// The capabilities the AF_XDP backend drops once the program is loaded.
-/// `CAP_NET_RAW` (13) and everything else are retained.
-const DROPPED_CAPS: [u32; 2] = [CAP_BPF, CAP_NET_ADMIN];
+const DROPPED_CAPS: [u32; 5] = [
+    CAP_BPF,
+    CAP_NET_ADMIN,
+    CAP_NET_RAW,
+    CAP_SYS_ADMIN,
+    CAP_SETPCAP,
+];
 
 /// Mirrors `struct __user_cap_header_struct` from `<linux/capability.h>`.
 #[repr(C)]
@@ -69,12 +83,7 @@ fn clear_caps(data: &mut [CapUserData], caps: &[u32]) {
     }
 }
 
-/// Drops `CAP_BPF` and `CAP_NET_ADMIN` from the calling thread, retaining
-/// `CAP_NET_RAW` (and everything else) for the AF_XDP datapath.
-///
-/// Must run on the vmm thread before any vCPU/worker thread is spawned so that
-/// those threads inherit the reduced set.
-pub(crate) fn drop_xdp_caps() -> io::Result<()> {
+fn capability_data() -> io::Result<[CapUserData; LINUX_CAPABILITY_U32S_3]> {
     let mut header = CapUserHeader {
         version: LINUX_CAPABILITY_VERSION_3,
         // pid 0 targets the calling thread.
@@ -97,7 +106,51 @@ pub(crate) fn drop_xdp_caps() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
+    Ok(data)
+}
+
+/// Rejects attempts to recreate privileged AF_XDP resources in a restricted VMM.
+pub(crate) fn check_xdp_setup() -> io::Result<()> {
+    if BPF_RESTRICTED.get() {
+        return Err(io::Error::other(
+            "AF_XDP setup requires a fresh VMM process",
+        ));
+    }
+    let data = capability_data()?;
+    for cap in [CAP_BPF, CAP_NET_ADMIN] {
+        if data[(cap / 32) as usize].effective & (1 << (cap % 32)) == 0 {
+            return Err(io::Error::other(
+                "AF_XDP setup requires CAP_BPF and CAP_NET_ADMIN in a fresh VMM process",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Drops setup authority before guest-facing threads are created.
+pub(crate) fn drop_xdp_caps() -> io::Result<()> {
+    let mut data = capability_data()?;
+    // SAFETY: valid PR_SET_NO_NEW_PRIVS arguments; the result is checked.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Modifying the bounding set requires CAP_SETPCAP. File-capability launches
+    // need not have it: clearing permitted/inheritable sets plus no_new_privs
+    // still prevents reacquisition through exec.
+    if data[0].effective & (1 << CAP_SETPCAP) != 0 {
+        for cap in DROPPED_CAPS {
+            // SAFETY: valid PR_CAPBSET_DROP arguments; the result is checked.
+            let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
     clear_caps(&mut data, &DROPPED_CAPS);
+    let header = CapUserHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
 
     // SAFETY: same struct layout/version contract as the capget call above;
     // capset only reads `header`/`data`. The return value is checked below.
@@ -112,26 +165,25 @@ pub(crate) fn drop_xdp_caps() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    // Remove the dropped caps from the bounding set so they cannot be
-    // re-acquired via a setuid-root exec.
-    for cap in DROPPED_CAPS {
-        // SAFETY: PR_CAPBSET_DROP takes the capability number in arg2; remaining
-        // prctl args are ignored. The return value is checked.
-        let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
+    Ok(())
+}
 
-    // Belt-and-braces alongside the seccomp filter: prevent privilege gain
-    // through exec. Harmless if already set.
-    // SAFETY: PR_SET_NO_NEW_PRIVS takes 1 in arg2; remaining args ignored. The
-    // return value is checked.
-    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
+/// Blocks all BPF operations, including updates through existing map FDs.
+/// The filter is inherited by subsequently created guest-facing threads.
+pub(crate) fn restrict_bpf() -> io::Result<()> {
+    if BPF_RESTRICTED.get() {
+        return Ok(());
     }
-
+    let filter: seccompiler::BpfProgram = SeccompFilter::new(
+        [(libc::SYS_bpf, Vec::new())].into(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        std::env::consts::ARCH.try_into().unwrap(),
+    )
+    .and_then(|filter| filter.try_into())
+    .map_err(io::Error::other)?;
+    apply_filter(&filter).map_err(io::Error::other)?;
+    BPF_RESTRICTED.set(true);
     Ok(())
 }
 
@@ -139,8 +191,69 @@ pub(crate) fn drop_xdp_caps() -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// `CAP_NET_RAW` from `<linux/capability.h>`; must be retained.
-    const CAP_NET_RAW: u32 = 13;
+    #[test]
+    fn capability_drop_and_bpf_filter_are_inherited() {
+        std::thread::spawn(|| {
+            let before = capability_data().unwrap();
+            #[cfg(feature = "kvm")]
+            {
+                let filter = crate::seccomp_filters::get_seccomp_filter(
+                    &SeccompAction::Errno(libc::EACCES as u32),
+                    crate::seccomp_filters::Thread::Vmm,
+                    Some(hypervisor::HypervisorType::Kvm),
+                )
+                .unwrap();
+                apply_filter(&filter).unwrap();
+            }
+            drop_xdp_caps().unwrap();
+            restrict_bpf().unwrap();
+            assert!(check_xdp_setup().is_err());
+            let check = move || {
+                let after = capability_data().unwrap();
+                for cap in [8u32, 12, 13, 21, 39] {
+                    let word = (cap / 32) as usize;
+                    let bit = 1 << (cap % 32);
+                    assert_eq!(after[word].effective & bit, 0);
+                    assert_eq!(after[word].permitted & bit, 0);
+                    assert_eq!(after[word].inheritable & bit, 0);
+                }
+                assert_eq!(
+                    after[0].effective & (1 << 10),
+                    before[0].effective & (1 << 10)
+                );
+                // SAFETY: an invalid BPF command with no attribute pointer.
+                let result = unsafe { libc::syscall(libc::SYS_bpf, u32::MAX, 0, 0) };
+                assert_eq!(result, -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+            };
+            check();
+            std::thread::spawn(check).join().unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn bpf_filter_blocks_even_with_setup_capabilities() {
+        std::thread::spawn(|| {
+            let data = capability_data().unwrap();
+            if data[1].effective & (1 << (39 - 32)) != 0 {
+                // SAFETY: invalid command, no attribute pointer. A privileged
+                // unfiltered caller receives EINVAL rather than EPERM.
+                assert_eq!(unsafe { libc::syscall(libc::SYS_bpf, u32::MAX, 0, 0) }, -1);
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EINVAL)
+                );
+            }
+            restrict_bpf().unwrap();
+            // SAFETY: invalid command, no attribute pointer.
+            assert_eq!(unsafe { libc::syscall(libc::SYS_bpf, u32::MAX, 0, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn clears_only_targeted_caps() {
@@ -166,14 +279,14 @@ mod tests {
         assert_eq!(data[1].permitted & bpf_bit, 0);
         assert_eq!(data[1].inheritable & bpf_bit, 0);
 
-        // CAP_NET_RAW (13) lives in word 0, bit 13; it must be retained.
+        // CAP_NET_RAW (13) is only needed to create sockets.
         let net_raw_bit = 1u32 << (CAP_NET_RAW % 32);
-        assert_eq!(data[0].effective & net_raw_bit, net_raw_bit);
-        assert_eq!(data[0].permitted & net_raw_bit, net_raw_bit);
-        assert_eq!(data[0].inheritable & net_raw_bit, net_raw_bit);
+        assert_eq!(data[0].effective & net_raw_bit, 0);
+        assert_eq!(data[0].permitted & net_raw_bit, 0);
+        assert_eq!(data[0].inheritable & net_raw_bit, 0);
 
-        // No other bit in word 0 was touched: only bit 12 should differ from MAX.
-        assert_eq!(data[0].effective, u32::MAX & !net_admin_bit);
+        let dropped_low = net_admin_bit | net_raw_bit | (1 << CAP_SYS_ADMIN) | (1 << CAP_SETPCAP);
+        assert_eq!(data[0].effective, u32::MAX & !dropped_low);
         // No other bit in word 1 was touched: only bit 7 should differ from MAX.
         assert_eq!(data[1].effective, u32::MAX & !bpf_bit);
     }

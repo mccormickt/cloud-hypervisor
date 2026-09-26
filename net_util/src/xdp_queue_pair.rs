@@ -53,6 +53,8 @@ pub enum XdpQueuePairError {
     QueueEnableNotification(#[source] virtio_queue::Error),
     #[error("Failed to determine if queue needed notification")]
     QueueNeedsNotification(#[source] virtio_queue::Error),
+    #[error("Failed to arm AF_XDP TX retry timer")]
+    RetryTimer(#[source] io::Error),
     #[error("AF_XDP datapath error")]
     Xdp(#[from] XdpError),
 }
@@ -71,8 +73,8 @@ fn rx_vnet_header() -> [u8; size_of::<virtio_net_hdr_v1>()] {
 }
 
 /// One virtio-net RX/TX queue pair backed by a single AF_XDP socket.
-pub struct XdpQueuePair {
-    pub xsk: Xsk,
+pub struct XdpQueuePair<'a> {
+    pub xsk: &'a mut Xsk,
     pub counters: NetCounters,
     tx_counter_bytes: Wrapping<u64>,
     tx_counter_frames: Wrapping<u64>,
@@ -85,11 +87,12 @@ pub struct XdpQueuePair {
     pub rx_rate_limiter: Option<RateLimiter>,
     pub tx_rate_limiter: Option<RateLimiter>,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
+    tx_deferred: bool,
 }
 
-impl XdpQueuePair {
+impl<'a> XdpQueuePair<'a> {
     pub fn new(
-        xsk: Xsk,
+        xsk: &'a mut Xsk,
         counters: NetCounters,
         xsk_rx_event_id: u16,
         rx_rate_limiter: Option<RateLimiter>,
@@ -110,6 +113,7 @@ impl XdpQueuePair {
             rx_rate_limiter,
             tx_rate_limiter,
             access_platform,
+            tx_deferred: false,
         }
     }
 
@@ -179,17 +183,30 @@ impl XdpQueuePair {
         queue: &mut Queue,
     ) -> Result<bool, XdpQueuePairError> {
         let hdr_len = vnet_hdr_len();
-        let mut rate_limit_reached = false;
-        let mut transmitted_any = false;
+        let mut rate_limit_reached = self
+            .tx_rate_limiter
+            .as_ref()
+            .is_some_and(|limiter| limiter.is_blocked());
+        self.tx_deferred = false;
 
         // Reclaim TX frames the kernel has finished with before sending more.
         self.xsk.complete();
+        self.xsk.refill()?;
 
+        let mut processed = 0;
         while let Some(mut desc_chain) = queue.pop_descriptor_chain(mem) {
+            // Include dropped/header-only chains in the budget so a guest
+            // cannot keep the worker away from kill and pause events.
+            if processed == 256 {
+                self.tx_deferred = true;
+                queue.go_to_previous_position();
+                break;
+            }
             if rate_limit_reached {
                 queue.go_to_previous_position();
                 break;
             }
+            processed += 1;
 
             let mut segments = Vec::new();
             let head_index = desc_chain.head_index();
@@ -201,17 +218,15 @@ impl XdpQueuePair {
             }
 
             let total: usize = segments.iter().map(|(_, len)| len).sum();
-            let bytes_sent = if total <= hdr_len {
+            let bytes_sent = if total <= hdr_len || total - hdr_len > crate::XDP_FRAME_SIZE as usize
+            {
                 0
             } else {
                 let payload_len = total - hdr_len;
 
-                // Reclaim completions and obtain a free TX frame. If none is
-                // available the TX ring is saturated; rewind and retry later.
-                if self.xsk.tx_alloc().is_none() {
-                    self.xsk.complete();
-                }
+                // Obtain one free TX frame. Completions were reclaimed above.
                 let Some((frame_index, addr)) = self.xsk.tx_alloc() else {
+                    self.tx_deferred = true;
                     queue.go_to_previous_position();
                     break;
                 };
@@ -227,26 +242,19 @@ impl XdpQueuePair {
 
                 // Strip the virtio_net_hdr; AF_XDP transmits raw L2 frames.
                 let payload = &packet[hdr_len..];
-                if payload_len > crate::XDP_FRAME_SIZE as usize {
-                    error!("xdp: tx: dropping oversized frame ({payload_len} bytes)");
-                    self.xsk.tx_recycle(frame_index);
-                    0
-                } else {
-                    let frame = self
-                        .xsk
-                        .tx_frame_mut(addr, payload_len as u32)
-                        .expect("UMEM frame within bounds");
-                    frame.copy_from_slice(payload);
+                let frame = self
+                    .xsk
+                    .tx_frame_mut(addr, payload_len as u32)
+                    .expect("UMEM frame within bounds");
+                frame.copy_from_slice(payload);
 
-                    if !self.xsk.transmit(addr, payload_len as u32)? {
-                        // TX ring filled between the alloc and the submit.
-                        self.xsk.tx_recycle(frame_index);
-                        queue.go_to_previous_position();
-                        break;
-                    }
-                    transmitted_any = true;
-                    payload_len as u64
+                if !self.xsk.transmit(addr, payload_len as u32)? {
+                    self.xsk.tx_recycle(frame_index);
+                    self.tx_deferred = true;
+                    queue.go_to_previous_position();
+                    break;
                 }
+                payload_len as u64
             };
 
             if let Some(rate_limiter) = &mut self.tx_rate_limiter {
@@ -272,7 +280,7 @@ impl XdpQueuePair {
             }
         }
 
-        if transmitted_any {
+        if self.xsk.has_pending_tx() {
             self.xsk.kick()?;
         }
 
@@ -288,6 +296,11 @@ impl XdpQueuePair {
         queue
             .needs_notification(mem)
             .map_err(XdpQueuePairError::QueueNeedsNotification)
+    }
+
+    /// Retry deferred descriptors and kernel wakeups without a new guest kick.
+    pub fn needs_tx_retry(&self) -> bool {
+        self.tx_deferred || self.xsk.has_pending_tx() || self.xsk.has_pending_refill()
     }
 
     pub fn process_rx<B: Bitmap + 'static>(
@@ -374,7 +387,7 @@ impl XdpQueuePair {
 
         // Return the consumed frames to the kernel.
         if processed > 0 {
-            self.xsk.rx_release(processed);
+            self.xsk.rx_release(processed)?;
             self.xsk.refill()?;
         }
 

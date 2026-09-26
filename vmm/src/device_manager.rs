@@ -2860,7 +2860,7 @@ impl DeviceManager {
 
         let (virtio_device, migratable_device) = if matches!(net_cfg.backend, NetBackend::AfXdp) {
             self.make_virtio_net_af_xdp_device(net_cfg, &id, snapshot)?
-        } else if net_cfg.vhost_user {
+        } else if net_cfg.is_vhost_user() {
             let socket = net_cfg.vhost_socket.as_ref().unwrap().clone();
             let vu_cfg = VhostUserConfig {
                 socket,
@@ -4623,6 +4623,7 @@ impl DeviceManager {
         }
 
         let device_type = virtio_device.lock().unwrap().device_type();
+        let defer_restore_activation = self.config.lock().unwrap().has_af_xdp_net();
         let virtio_pci_device = Arc::new(Mutex::new(
             VirtioPciDevice::new(
                 id.clone(),
@@ -4641,6 +4642,7 @@ impl DeviceManager {
                 dma_handler,
                 Arc::clone(&self.pending_activations),
                 vm_migration::snapshot_from_id(snapshot, id.as_str()),
+                defer_restore_activation,
             )
             .map_err(DeviceManagerError::VirtioDevice)?,
         ));
@@ -4968,6 +4970,20 @@ impl DeviceManager {
             // Failures are logged and signalled to the guest via
             // NEEDS_RESET by the activator, hence keep going.
             let _ = activator.activate();
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "net_backend_af_xdp")]
+    pub fn activate_restored_virtio_devices(&self) -> DeviceManagerResult<()> {
+        for activator in self.pending_activations.lock().unwrap().drain(..) {
+            activator.activate().map_err(|e| {
+                DeviceManagerError::VirtioDevice(
+                    transport::VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
+                        "Failed activating the restored device: {e}"
+                    )),
+                )
+            })?;
         }
         Ok(())
     }

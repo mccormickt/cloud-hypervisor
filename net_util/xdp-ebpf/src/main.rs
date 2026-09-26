@@ -7,7 +7,8 @@
 //! For every received packet, this looks up the AF_XDP socket bound to the
 //! packet's RX queue in `XSKS_MAP` and redirects the packet to it. Packets on
 //! queues with no registered socket are passed up the normal kernel stack
-//! (`XDP_PASS`), so the program is safe to attach to a shared interface.
+//! (`XDP_PASS`). Registered queues redirect all traffic without classification;
+//! use a dedicated interface, not a shared host interface.
 //!
 //! The userspace loader (`net_util::XdpProgram`) populates
 //! `XSKS_MAP[queue_id]` with one XSK fd per queue while Cloud Hypervisor still

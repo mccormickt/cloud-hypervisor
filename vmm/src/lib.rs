@@ -2735,6 +2735,11 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_reboot(&mut self) -> result::Result<(), VmError> {
+        if let VmOwnership::Owned(vm) = &self.vm
+            && vm.get_config().lock().unwrap().has_af_xdp_net()
+        {
+            return Err(VmError::AfXdpRebootUnsupported);
+        }
         event!("vm", "rebooting");
 
         // Drop VM early to release disk locks and free other resources before

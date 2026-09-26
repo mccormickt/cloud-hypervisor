@@ -663,13 +663,13 @@ fn vmm_thread_rules(
         (libc::SYS_arch_prctl, vec![]),
         (libc::SYS_bind, vec![]),
         // AF_XDP: bpf() loads the XDP redirect program and creates/populates
-        // xsks_map at device creation; returns EPERM once CAP_BPF is dropped at
-        // boot, so it is only needed transiently.
+        // xsks_map at device creation. A mandatory stacked filter denies it
+        // after setup, before guest-facing threads start.
         #[cfg(feature = "net_backend_af_xdp")]
         (libc::SYS_bpf, vec![]),
         (libc::SYS_brk, vec![]),
-        // AF_XDP: capget/capset drop CAP_BPF and CAP_NET_ADMIN at boot, before
-        // the vCPU threads are spawned.
+        // AF_XDP: capget/capset remove setup capabilities before guest-facing
+        // threads start, including on restore.
         #[cfg(feature = "net_backend_af_xdp")]
         (libc::SYS_capget, vec![]),
         #[cfg(feature = "net_backend_af_xdp")]

@@ -160,6 +160,13 @@ pub enum Error {
     #[error("Failed to drop privileged capabilities for the AF_XDP backend")]
     DropCapabilities(#[source] io::Error),
 
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[error("AF_XDP setup is unavailable")]
+    AfXdpSetup(#[source] io::Error),
+
+    #[error("AF_XDP VM reboot requires a fresh VMM process")]
+    AfXdpRebootUnsupported,
+
     #[error(
         "The AF_XDP network backend cannot be hot-plugged; it must be configured at boot \
          (privileged capabilities are dropped once the guest is running)"
@@ -611,6 +618,11 @@ impl Vm {
             .validate()
             .map_err(Error::ConfigValidation)?;
 
+        #[cfg(feature = "net_backend_af_xdp")]
+        if config.lock().unwrap().has_af_xdp_net() {
+            crate::cap::check_xdp_setup().map_err(Error::AfXdpSetup)?;
+        }
+
         info!("Booting VM from config: {config:?}");
 
         // Create NUMA nodes based on NumaConfig.
@@ -728,6 +740,22 @@ impl Vm {
         } else {
             VmState::Created
         };
+
+        #[cfg(feature = "net_backend_af_xdp")]
+        {
+            let has_xdp = config.lock().unwrap().has_af_xdp_net();
+            if has_xdp {
+                crate::cap::drop_xdp_caps().map_err(Error::DropCapabilities)?;
+            }
+            crate::cap::restrict_bpf().map_err(Error::DropCapabilities)?;
+            if has_xdp && snapshot.is_some() {
+                device_manager
+                    .lock()
+                    .unwrap()
+                    .activate_restored_virtio_devices()
+                    .map_err(Error::DeviceManager)?;
+            }
+        }
 
         Ok(Vm {
             #[cfg(feature = "tdx")]
@@ -2780,21 +2808,6 @@ impl Vm {
             .transpose()
     }
 
-    /// Whether the VM config contains at least one `backend=xdp` net device.
-    /// Used to decide whether the privileged-capability drop is needed at boot.
-    #[cfg(feature = "net_backend_af_xdp")]
-    fn config_has_af_xdp_net(&self) -> bool {
-        self.config
-            .lock()
-            .unwrap()
-            .net
-            .as_ref()
-            .is_some_and(|nets| {
-                nets.iter()
-                    .any(|n| n.backend == crate::vm_config::NetBackend::AfXdp)
-            })
-    }
-
     pub fn boot(&mut self) -> Result<()> {
         trace_scoped!("Vm::boot");
         let current_state = self.state;
@@ -2993,17 +3006,6 @@ impl Vm {
         // Resume the vm for MSHV
         if current_state == VmState::Created {
             self.vm.resume().map_err(Error::ResumeVm)?;
-        }
-
-        // Drop the privileged capabilities the in-process AF_XDP backend needed
-        // at device creation (CAP_BPF, CAP_NET_ADMIN) before any vCPU thread is
-        // spawned. The redirect program is loaded and `xsks_map` populated, so
-        // the datapath only needs CAP_NET_RAW from here on; vCPU and
-        // virtio-worker threads spawned afterwards inherit the reduced set.
-        #[cfg(feature = "net_backend_af_xdp")]
-        if self.config_has_af_xdp_net() {
-            info!("AF_XDP backend in use: dropping CAP_BPF and CAP_NET_ADMIN");
-            crate::cap::drop_xdp_caps().map_err(Error::DropCapabilities)?;
         }
 
         self.cpu_manager

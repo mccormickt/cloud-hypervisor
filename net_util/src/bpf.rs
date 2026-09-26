@@ -14,11 +14,11 @@
 //! The `Ebpf` handle is kept alive for the device's lifetime: dropping it
 //! detaches the program and frees the map.
 
-use std::os::unix::io::AsRawFd;
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
-use aya::maps::{MapData, XskMap};
-use aya::programs::xdp::XdpLinkId;
-use aya::programs::{Xdp, XdpMode};
+use aya::maps::{MapData, MapError, XskMap};
+use aya::programs::{ProgramError, Xdp};
 use aya::{Ebpf, EbpfLoader};
 use thiserror::Error;
 
@@ -43,17 +43,17 @@ pub enum XdpProgramError {
     #[error("XDP redirect program is missing the {0:?} map")]
     MissingMap(&'static str),
     #[error("Failed to access the {0:?} map")]
-    Map(&'static str, #[source] aya::maps::MapError),
+    Map(&'static str, #[source] MapError),
     #[error("XDP redirect program is missing the {0:?} program")]
     MissingProgram(&'static str),
     #[error("Failed to access the {0:?} program")]
-    Program(&'static str, #[source] aya::programs::ProgramError),
+    Program(&'static str, #[source] ProgramError),
     #[error("Failed to load the {0:?} program into the kernel")]
-    ProgramLoad(&'static str, #[source] aya::programs::ProgramError),
-    #[error("Failed to attach the XDP redirect program to {0:?}")]
-    Attach(String, #[source] aya::programs::ProgramError),
+    ProgramLoad(&'static str, #[source] ProgramError),
+    #[error("Failed to create an FD-owned XDP link on {0:?}")]
+    Attach(String, #[source] io::Error),
     #[error("Failed to insert XSK fd for queue {0} into the xsks_map")]
-    InsertXsk(u32, #[source] aya::maps::MapError),
+    InsertXsk(u32, #[source] MapError),
 }
 
 /// How the XDP redirect program attaches to the host interface.
@@ -63,8 +63,7 @@ pub enum XdpAttachMode {
     /// mode if the driver has no native XDP support.
     #[default]
     Auto,
-    /// Force generic (SKB) mode. Required on `veth` and other interfaces that
-    /// lack native XDP support.
+    /// Request generic (SKB) mode. Requires kernel support for FD-owned links.
     Skb,
 }
 
@@ -77,18 +76,10 @@ pub struct XdpProgram {
     // this map fd and requires no privileged capability, so it stays usable
     // after CAP_BPF is dropped.
     xsks_map: XskMap<MapData>,
-    // The attach links are owned by the programs inside `_ebpf`; these ids are
-    // kept so the successful attaches are explicit and self-documenting.
-    // `_pass_link` is `Some` only when a peer interface was given.
-    _link: XdpLinkId,
-    _pass_link: Option<XdpLinkId>,
+    // Closing an FD-owned link detaches without CAP_NET_ADMIN.
+    _link: OwnedFd,
+    _pass_link: Option<OwnedFd>,
 }
-
-// SAFETY: `XdpProgram` owns its `Ebpf` (which owns the program/map `OwnedFd`s
-// and parsed objects) and a plain link id. None of these share state with other
-// threads. The struct is created on the vmm thread and only moved (never
-// aliased) into the `Net` device, matching how `Xsk` is treated.
-unsafe impl Send for XdpProgram {}
 
 impl XdpProgram {
     /// Loads the embedded program and attaches the redirect to `iface`.
@@ -157,22 +148,52 @@ impl XdpProgram {
 }
 
 /// Attaches `program` to `iface`, honoring [`XdpAttachMode`].
-fn attach(
-    program: &mut Xdp,
-    iface: &str,
-    mode: XdpAttachMode,
-) -> Result<XdpLinkId, XdpProgramError> {
-    let attach_err = |e| XdpProgramError::Attach(iface.to_owned(), e);
-    match mode {
-        XdpAttachMode::Skb => program.attach(iface, XdpMode::Skb).map_err(attach_err),
-        XdpAttachMode::Auto => match program.attach(iface, XdpMode::Default) {
-            Ok(link) => Ok(link),
-            Err(e) => {
-                log::warn!(
-                    "xdp: native attach to {iface:?} failed ({e}); falling back to SKB mode"
-                );
-                program.attach(iface, XdpMode::Skb).map_err(attach_err)
-            }
-        },
+fn attach(program: &mut Xdp, iface: &str, mode: XdpAttachMode) -> Result<OwnedFd, XdpProgramError> {
+    // Linux UAPI bpf_attr.link_create prefix. All optional fields are zero
+    // because the kernel zero-extends the supplied attribute size.
+    #[repr(C)]
+    struct LinkCreate {
+        prog_fd: u32,
+        target_ifindex: u32,
+        attach_type: u32,
+        flags: u32,
     }
+    const BPF_LINK_CREATE: libc::c_uint = 28;
+    const BPF_XDP: u32 = 37;
+    const XDP_FLAGS_SKB_MODE: u32 = 1 << 1;
+
+    let attach_err = |e| XdpProgramError::Attach(iface.to_owned(), e);
+    let ifindex = crate::iface_index(iface).map_err(|e| attach_err(io::Error::other(e)))?;
+    let fd = program.fd().map_err(|e| attach_err(io::Error::other(e)))?;
+    let create = |flags| {
+        let attr = LinkCreate {
+            prog_fd: fd.as_fd().as_raw_fd() as u32,
+            target_ifindex: ifindex,
+            attach_type: BPF_XDP,
+            flags,
+        };
+        // SAFETY: attr matches the Linux UAPI prefix and is valid for the
+        // supplied size. A successful call returns a new owned descriptor.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_LINK_CREATE,
+                &attr,
+                size_of::<LinkCreate>(),
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: the successful syscall returned a new owned FD.
+            Ok(unsafe { OwnedFd::from_raw_fd(result as libc::c_int) })
+        }
+    };
+    // Never use legacy netlink attachment: its cleanup requires capabilities
+    // that the VMM drops before guest execution.
+    match mode {
+        XdpAttachMode::Auto => create(0).or_else(|_| create(XDP_FLAGS_SKB_MODE)),
+        XdpAttachMode::Skb => create(XDP_FLAGS_SKB_MODE),
+    }
+    .map_err(attach_err)
 }

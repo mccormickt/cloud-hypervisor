@@ -268,6 +268,10 @@ pub enum ValidationError {
     /// AF_XDP backend does not support a virtual IOMMU.
     #[error("AF_XDP network backend does not support being placed behind an IOMMU")]
     XdpIommuNotSupported,
+    #[error("AF_XDP requires exactly one queue pair (num_queues=2)")]
+    XdpMultiqueueNotSupported,
+    #[error("xdp_* options require the AF_XDP backend")]
+    XdpOptionsWithoutBackend,
     /// Requested MTU exceeds the AF_XDP single-frame budget.
     #[error("AF_XDP MTU {0} exceeds the maximum {1} imposed by the aligned-chunk UMEM frame size")]
     XdpMtuTooLarge(u16 /* requested */, u16 /* maximum */),
@@ -1960,6 +1964,10 @@ impl NetConfig {
         Ok(config)
     }
 
+    pub(crate) fn is_vhost_user(&self) -> bool {
+        self.vhost_user || self.backend == NetBackend::VhostUser
+    }
+
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         self.pci_common.validate(vm_config)?;
 
@@ -1992,11 +2000,11 @@ impl NetConfig {
 
         validate_queue_size(self.queue_size)?;
 
-        if self.vhost_user && self.pci_common.iommu {
+        if self.is_vhost_user() && self.pci_common.iommu {
             return Err(ValidationError::IommuNotSupported);
         }
 
-        if self.vhost_user && self.rate_limiter_config.is_some() {
+        if self.is_vhost_user() && self.rate_limiter_config.is_some() {
             return Err(ValidationError::VhostUserRateLimiterNotSupported);
         }
 
@@ -2033,11 +2041,20 @@ impl NetConfig {
             if self.xdp_iface.is_none() {
                 return Err(ValidationError::XdpMissingIface);
             }
+            if self.num_queues != 2 {
+                return Err(ValidationError::XdpMultiqueueNotSupported);
+            }
             if let Some(mtu) = self.mtu
                 && mtu > net_util::XDP_MAX_MTU
             {
                 return Err(ValidationError::XdpMtuTooLarge(mtu, net_util::XDP_MAX_MTU));
             }
+        } else if self.xdp_iface.is_some()
+            || self.xdp_peer.is_some()
+            || self.xdp_skb
+            || self.xdp_zerocopy
+        {
+            return Err(ValidationError::XdpOptionsWithoutBackend);
         }
 
         Ok(())
@@ -3331,6 +3348,12 @@ impl IvshmemConfig {
 }
 
 impl VmConfig {
+    pub(crate) fn has_af_xdp_net(&self) -> bool {
+        self.net
+            .as_ref()
+            .is_some_and(|nets| nets.iter().any(|net| net.backend == NetBackend::AfXdp))
+    }
+
     fn validate_identifier(
         id_list: &mut BTreeSet<String>,
         id: &Option<String>,
@@ -3530,13 +3553,13 @@ impl VmConfig {
 
         if let Some(nets) = &self.net {
             for net in nets {
-                if net.vhost_user && !self.backed_by_shared_memory() {
+                if net.is_vhost_user() && !self.backed_by_shared_memory() {
                     return Err(ValidationError::VhostUserRequiresSharedMemory);
                 }
-                if net.vhost_user && net.vhost_socket.is_none() {
+                if net.is_vhost_user() && net.vhost_socket.is_none() {
                     return Err(ValidationError::VhostUserMissingSocket);
                 }
-                if net.vhost_user && net.rate_limiter_config.is_some() {
+                if net.is_vhost_user() && net.rate_limiter_config.is_some() {
                     return Err(ValidationError::VhostUserRateLimiterNotSupported);
                 }
                 net.validate(self)?;
@@ -7499,8 +7522,51 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 invalid_config.validate(),
                 Err(ValidationError::XdpMtuTooLarge(9000, net_util::XDP_MAX_MTU))
             );
+
+            for (mtu, valid) in [(3826, true), (3827, false)] {
+                let mut config = valid_config.clone();
+                config.net = Some(vec![NetConfig {
+                    mtu: Some(mtu),
+                    ..xdp_net.clone()
+                }]);
+                assert_eq!(config.validate().is_ok(), valid);
+            }
+            for num_queues in [3, 4] {
+                let mut config = valid_config.clone();
+                config.cpus.boot_vcpus = 2;
+                config.cpus.max_vcpus = 2;
+                config.net = Some(vec![NetConfig {
+                    num_queues,
+                    ..xdp_net.clone()
+                }]);
+                assert_eq!(
+                    config.validate(),
+                    Err(ValidationError::XdpMultiqueueNotSupported)
+                );
+            }
         }
     }
+
+    #[test]
+    fn json_vhost_backend_uses_vhost_validation() {
+        let net: NetConfig = serde_json::from_str(r#"{"backend":"vhost_user"}"#).unwrap();
+        assert!(!net.vhost_user);
+        assert!(net.is_vhost_user());
+        let mut config: VmConfig =
+            serde_json::from_str(r#"{"payload":{"kernel":"kernel"}}"#).unwrap();
+        config.net = Some(vec![net]);
+        config.memory.shared = true;
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::VhostUserMissingSocket)
+        );
+        config.net = Some(vec![NetConfig::parse("xdp_iface=eth0").unwrap()]);
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::XdpOptionsWithoutBackend)
+        );
+    }
+
     #[test]
     fn test_landlock_parsing() -> Result<()> {
         // should not be empty

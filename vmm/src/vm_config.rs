@@ -515,13 +515,11 @@ pub struct NetConfig {
     /// Leave unset for a real NIC.
     #[serde(default)]
     pub xdp_peer: Option<String>,
-    /// Force the XDP redirect program to attach in generic (SKB) mode rather
-    /// than letting the kernel pick native driver mode. Required on `veth` and
-    /// other interfaces without native XDP support.
+    /// Request generic (SKB) mode; requires kernel support for FD-owned links.
     #[serde(default)]
     pub xdp_skb: bool,
-    /// Request AF_XDP zero-copy mode (`XDP_ZEROCOPY`). Falls back to copy mode
-    /// at bind time on drivers without zero-copy support.
+    /// Require AF_XDP zero-copy mode (`XDP_ZEROCOPY`). Unsupported drivers
+    /// fail at bind time; guest data is still copied into UMEM.
     #[serde(default)]
     pub xdp_zerocopy: bool,
 }
