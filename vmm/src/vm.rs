@@ -87,6 +87,8 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+#[cfg(feature = "net_backend_af_xdp")]
+use crate::cap;
 use crate::config::{MemoryRestoreMode, ValidationError, add_to_config};
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -113,8 +115,9 @@ use crate::sev::MeasuredBootInfo;
 #[cfg(feature = "fw_cfg")]
 use crate::vm_config::FwCfgConfig;
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
-    NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetBackend,
+    NetConfig, NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig,
+    VsockConfig,
 };
 use crate::{
     CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemoryMmap,
@@ -155,6 +158,23 @@ pub enum Error {
 
     #[error("Failed to apply landlock config during vm_create")]
     ApplyLandlock(#[source] LandlockError),
+
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[error("Failed to drop privileged capabilities for the AF_XDP backend")]
+    DropCapabilities(#[source] io::Error),
+
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[error("AF_XDP setup is unavailable")]
+    AfXdpSetup(#[source] io::Error),
+
+    #[error("AF_XDP VM reboot requires a fresh VMM process")]
+    AfXdpRebootUnsupported,
+
+    #[error(
+        "The AF_XDP network backend cannot be hot-plugged; it must be configured at boot \
+         (privileged capabilities are dropped once the guest is running)"
+    )]
+    AfXdpHotplugUnsupported,
 
     #[error("Cannot modify the kernel command line")]
     CmdLineInsertStr(#[source] cmdline::Error),
@@ -601,6 +621,11 @@ impl Vm {
             .validate()
             .map_err(Error::ConfigValidation)?;
 
+        #[cfg(feature = "net_backend_af_xdp")]
+        if config.lock().unwrap().has_af_xdp_net() {
+            cap::check_xdp_setup().map_err(Error::AfXdpSetup)?;
+        }
+
         info!("Booting VM from config: {config:?}");
 
         // Create NUMA nodes based on NumaConfig.
@@ -718,6 +743,22 @@ impl Vm {
         } else {
             VmState::Created
         };
+
+        #[cfg(feature = "net_backend_af_xdp")]
+        {
+            let has_xdp = config.lock().unwrap().has_af_xdp_net();
+            if has_xdp {
+                cap::drop_xdp_caps().map_err(Error::DropCapabilities)?;
+                cap::restrict_bpf().map_err(Error::DropCapabilities)?;
+            }
+            if has_xdp && snapshot.is_some() {
+                device_manager
+                    .lock()
+                    .unwrap()
+                    .activate_restored_virtio_devices()
+                    .map_err(Error::DeviceManager)?;
+            }
+        }
 
         Ok(Vm {
             #[cfg(feature = "tdx")]
@@ -2352,6 +2393,13 @@ impl Vm {
     }
 
     pub fn add_net(&mut self, mut net_cfg: NetConfig) -> Result<PciDeviceInfo> {
+        // The AF_XDP backend loads its BPF program at device creation while CH
+        // still holds CAP_BPF/CAP_NET_ADMIN. Those capabilities are dropped once
+        // the guest is running, so the backend cannot be hot-plugged.
+        if net_cfg.backend == NetBackend::AfXdp {
+            return Err(Error::AfXdpHotplugUnsupported);
+        }
+
         let pci_device_info = self
             .device_manager
             .lock()

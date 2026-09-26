@@ -78,6 +78,8 @@ use crate::vm_config::{
 
 mod acpi;
 pub mod api;
+#[cfg(feature = "net_backend_af_xdp")]
+mod cap;
 mod clone3;
 pub mod config;
 pub mod console_devices;
@@ -395,6 +397,8 @@ pub fn feature_list() -> Vec<String> {
         "kvm".to_string(),
         #[cfg(feature = "mshv")]
         "mshv".to_string(),
+        #[cfg(feature = "net_backend_af_xdp")]
+        "net_backend_af_xdp".to_string(),
         #[cfg(feature = "sev_snp")]
         "sev_snp".to_string(),
         #[cfg(feature = "tdx")]
@@ -2731,6 +2735,11 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_reboot(&mut self) -> result::Result<(), VmError> {
+        if let VmOwnership::Owned(vm) = &self.vm
+            && vm.get_config().lock().unwrap().has_af_xdp_net()
+        {
+            return Err(VmError::AfXdpRebootUnsupported);
+        }
         event!("vm", "rebooting");
 
         // Drop VM early to release disk locks and free other resources before

@@ -435,6 +435,7 @@ impl VirtioPciDevice {
         dma_handler: Option<Arc<dyn ExternalDmaMapping>>,
         pending_activations: Arc<Mutex<Vec<VirtioPciDeviceActivator>>>,
         snapshot: Option<&Snapshot>,
+        defer_restore_activation: bool,
     ) -> Result<Self> {
         let mut locked_device = device.lock().unwrap();
         let mut queue_evts = Vec::new();
@@ -647,11 +648,20 @@ impl VirtioPciDevice {
         if virtio_pci_device.device_activated.load(Ordering::SeqCst)
             && virtio_pci_device.is_driver_ready()
         {
-            virtio_pci_device.activate().map_err(|e| {
-                VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
-                    "Failed activating the device: {e}"
-                ))
-            })?;
+            if defer_restore_activation {
+                let activator = virtio_pci_device.prepare_activator(None);
+                virtio_pci_device
+                    .pending_activations
+                    .lock()
+                    .unwrap()
+                    .push(activator);
+            } else {
+                virtio_pci_device.activate().map_err(|e| {
+                    VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
+                        "Failed activating the device: {e}"
+                    ))
+                })?;
+            }
         }
 
         Ok(virtio_pci_device)
@@ -1692,6 +1702,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(Vec::new())),
             None,
+            false,
         )
         .unwrap()
     }
@@ -1720,6 +1731,40 @@ mod tests {
         let mut dev = make_virtio_pci_device();
         dev.add_pci_capabilities(0).unwrap();
         assert!(!has_device_config_cap(&dev.configuration));
+    }
+
+    #[test]
+    fn restored_activation_can_be_deferred_until_privileges_are_removed() {
+        let mut source = make_virtio_pci_device();
+        source.device_activated.store(true, Ordering::SeqCst);
+        source.common_config.driver_status.store(
+            (DEVICE_ACKNOWLEDGE | DEVICE_DRIVER | DEVICE_DRIVER_OK | DEVICE_FEATURES_OK) as u8,
+            Ordering::SeqCst,
+        );
+        let snapshot = source.snapshot().unwrap();
+        let device = Arc::new(Mutex::new(TestVirtioDevice {
+            result: Mutex::new(Some(Ok(()))),
+        }));
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let _restored = VirtioPciDevice::new(
+            "test-dev".to_string(),
+            source.memory.clone(),
+            Arc::clone(&device) as Arc<Mutex<dyn VirtioDevice>>,
+            None,
+            &TestInterruptManager,
+            0,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            false,
+            None,
+            Arc::clone(&pending),
+            Some(&snapshot),
+            true,
+        )
+        .unwrap();
+        assert!(device.lock().unwrap().result.lock().unwrap().is_some());
+        assert_eq!(pending.lock().unwrap().len(), 1);
+        pending.lock().unwrap().pop().unwrap().activate().unwrap();
+        assert!(device.lock().unwrap().result.lock().unwrap().is_none());
     }
 
     struct QueuedTestDevice {
@@ -1757,6 +1802,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(Vec::new())),
             None,
+            false,
         )
         .unwrap()
     }

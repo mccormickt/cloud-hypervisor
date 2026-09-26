@@ -268,6 +268,47 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Formatting (fuzz) (rustfmt)
         run: cargo fmt --all --manifest-path fuzz/Cargo.toml -- --check
+  af-xdp:
+    name: af-xdp
+    needs: [preflight]
+    if: needs.preflight.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2026-09-25
+          components: rust-src, clippy
+      - name: Install build dependencies
+        run: |
+          set -eufo pipefail
+          . /etc/os-release
+          curl --fail --silent --show-error https://apt.llvm.org/llvm-snapshot.gpg.key |
+            sudo tee /usr/share/keyrings/apt-llvm.asc > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/apt-llvm.asc] https://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-23 main" |
+            sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get -yqq install build-essential libssl-dev pkg-config llvm-23-dev libclang-23-dev
+      - name: Build pinned BPF linker from source
+        env:
+          LLVM_PREFIX: /usr/lib/llvm-23
+        run: |
+          set -eufo pipefail
+          cargo install bpf-linker --version 0.11.1 --locked
+          test "$(bpf-linker --version)" = 'bpf-linker 0.11.1'
+      - name: Check AF_XDP workspace
+        run: cargo check --locked --workspace --all-targets --features kvm,net_backend_af_xdp
+      - name: Lint AF_XDP including privileged test code
+        env:
+          RUSTFLAGS: --cfg devcli_testenv
+        run: cargo clippy --locked -p net_util -p virtio-devices --all-targets --features kvm,net_backend_af_xdp -- -D warnings
+      - name: Test AF_XDP units
+        run: cargo test --locked -p net_util -p virtio-devices --lib --features kvm,net_backend_af_xdp
+      - name: Check lockfile integrity
+        run: git diff --exit-code -- Cargo.lock net_util/xdp-ebpf/Cargo.lock
   package-consistency:
     name: package-consistency
     needs: [preflight]
@@ -1003,6 +1044,7 @@ jobs:
   all-green:
     name: all-green
     needs:
+      - af-xdp
       - audit
       - build
       - build-riscv64
