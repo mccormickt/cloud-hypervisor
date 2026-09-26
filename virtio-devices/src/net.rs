@@ -2082,6 +2082,8 @@ mod tests {
     #[cfg(all(devcli_testenv, feature = "net_backend_af_xdp"))]
     #[test]
     fn test_xdp_reset_and_timer_progress() {
+        use std::thread;
+
         use vm_memory::{Bytes, GuestAddress};
         use vm_virtio::queue::testing::VirtQueue;
 
@@ -2115,8 +2117,8 @@ mod tests {
             .unwrap();
         for round in 0..2 {
             let memory = mem.memory();
-            let rx = VirtQueue::new(GuestAddress(0x10_0000 + round * 0x20_0000), &*memory, 256);
-            let tx = VirtQueue::new(GuestAddress(0x20_0000 + round * 0x20_0000), &*memory, 256);
+            let rx = VirtQueue::new(GuestAddress(0x10_0000 + round * 0x20_0000), &memory, 256);
+            let tx = VirtQueue::new(GuestAddress(0x20_0000 + round * 0x20_0000), &memory, 256);
             for index in 0..128u16 {
                 tx.dtable[index as usize].set(0x1000, packet.len() as u32, 0, 0);
                 tx.avail.ring[index as usize].set(index);
@@ -2144,7 +2146,7 @@ mod tests {
                 if tx.used.idx.get() == 128 {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                thread::sleep(Duration::from_millis(1));
             }
             assert_eq!(
                 tx.used.idx.get(),
@@ -2165,15 +2167,15 @@ mod tests {
             if !xsk.has_pending_tx() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         }
         assert!(!xsk.has_pending_tx());
         let (_, addr) = xsk.tx_alloc().unwrap();
         xsk.tx_frame_mut(addr, 60).unwrap().fill(0xff);
         assert!(xsk.transmit(addr, 60).unwrap());
         let memory = mem.memory();
-        let rx = VirtQueue::new(GuestAddress(0x70_0000), &*memory, 256);
-        let tx = VirtQueue::new(GuestAddress(0x80_0000), &*memory, 256);
+        let rx = VirtQueue::new(GuestAddress(0x70_0000), &memory, 256);
+        let tx = VirtQueue::new(GuestAddress(0x80_0000), &memory, 256);
         let mut handler = XdpNetEpollHandler {
             net: XdpQueuePair::new(&mut xsk, NetCounters::default(), 0, None, None, None),
             mem: mem.clone(),

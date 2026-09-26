@@ -5,6 +5,9 @@
 // xdp-test0 veth interface. These tests need CAP_NET_RAW and sufficient memlock.
 #![cfg(all(devcli_testenv, feature = "net_backend_af_xdp"))]
 
+use std::thread;
+use std::time::Duration;
+
 use net_util::{
     NetCounters, XdpAttachMode, XdpProgram, XdpQueuePair, XdpSocketConfig, Xsk, iface_index,
     vnet_hdr_len,
@@ -46,17 +49,17 @@ fn free_tx_frames(xsk: &mut Xsk) -> usize {
 fn safe_tx_api_rejects_rx_and_inflight_frames() {
     let mut xsk = socket();
     assert!(xsk.tx_frame_mut(0, 60).is_none());
-    assert!(xsk.transmit(0, 60).is_err());
+    xsk.transmit(0, 60).unwrap_err();
     assert!(xsk.tx_recycle(0).is_err());
     let (frame, addr) = xsk.tx_alloc().unwrap();
     assert!(xsk.tx_frame_mut(addr + 1, 60).is_none());
     assert!(xsk.tx_frame_mut(addr, 4097).is_none());
-    assert!(xsk.transmit(addr, 0).is_err());
-    assert!(xsk.transmit(addr, 4097).is_err());
+    xsk.transmit(addr, 0).unwrap_err();
+    xsk.transmit(addr, 4097).unwrap_err();
     xsk.tx_frame_mut(addr, 60).unwrap().fill(0xff);
     assert!(xsk.transmit(addr, 60).unwrap());
     assert!(xsk.tx_frame_mut(addr, 60).is_none());
-    assert!(xsk.transmit(addr, 60).is_err());
+    xsk.transmit(addr, 60).unwrap_err();
     assert!(xsk.tx_recycle(frame).is_err());
     let (frame, _) = xsk.tx_alloc().unwrap();
     xsk.tx_recycle(frame).unwrap();
@@ -65,8 +68,6 @@ fn safe_tx_api_rejects_rx_and_inflight_frames() {
 
 #[test]
 fn stalled_tx_backs_off_and_recovers_without_a_guest_kick() {
-    use std::time::Duration;
-
     let mem =
         GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x20_0000)]).unwrap();
     let guest_q = VirtQueue::new(GuestAddress(0x10_0000), &mem, 2);
@@ -121,12 +122,12 @@ fn tx_reclaims_every_frame() {
         assert_eq!(queue.next_used(), i + 1);
         for _ in 0..100 {
             net.xsk.kick().unwrap();
-            if free_tx_frames(&mut net.xsk) == 64 {
+            if free_tx_frames(net.xsk) == 64 {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(free_tx_frames(&mut net.xsk), 64);
+        assert_eq!(free_tx_frames(net.xsk), 64);
     }
 }
 
@@ -144,7 +145,7 @@ fn tx_rejects_oversized_descriptor_before_reading_memory() {
 
     net.process_tx(&mem, &mut queue).unwrap();
     assert_eq!(queue.next_used(), 1);
-    assert_eq!(free_tx_frames(&mut net.xsk), 64);
+    assert_eq!(free_tx_frames(net.xsk), 64);
 }
 
 #[test]
@@ -170,12 +171,12 @@ fn tx_burst_progresses_without_new_guest_descriptors() {
         if !net.needs_tx_retry() {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(1));
         net.process_tx(&mem, &mut queue).unwrap();
     }
     assert_eq!(queue.next_used(), 256);
     assert!(!net.needs_tx_retry());
-    assert_eq!(free_tx_frames(&mut net.xsk), 64);
+    assert_eq!(free_tx_frames(net.xsk), 64);
 }
 
 #[test]
@@ -210,7 +211,7 @@ fn rx_recycles_frames_and_fd_links_detach() {
             if received {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         }
         assert!(received, "missing RX packet {sequence}");
     }
@@ -252,5 +253,5 @@ fn header_only_tx_yields_and_continues() {
     net.process_tx(&mem, &mut queue).unwrap();
     assert_eq!(queue.next_used(), 512);
     assert!(!net.needs_tx_retry());
-    assert_eq!(free_tx_frames(&mut net.xsk), 64);
+    assert_eq!(free_tx_frames(net.xsk), 64);
 }

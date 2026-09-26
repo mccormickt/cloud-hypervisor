@@ -281,7 +281,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: nightly-2026-09-25
-          components: rust-src
+          components: rust-src, clippy
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get -yqq install build-essential libssl-dev pkg-config
       - name: Build pinned BPF linker from source
@@ -291,6 +291,10 @@ jobs:
           test "$(bpf-linker --version)" = 'bpf-linker 0.11.1'
       - name: Check AF_XDP workspace
         run: cargo check --locked --workspace --all-targets --features kvm,net_backend_af_xdp
+      - name: Lint AF_XDP including privileged test code
+        env:
+          RUSTFLAGS: --cfg devcli_testenv
+        run: cargo clippy --locked -p net_util -p virtio-devices --all-targets --features kvm,net_backend_af_xdp -- -D warnings
       - name: Test AF_XDP units
         run: cargo test --locked -p net_util -p virtio-devices --lib --features kvm,net_backend_af_xdp
       - name: Check lockfile integrity
