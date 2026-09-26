@@ -16,11 +16,12 @@ Builds without this feature retain Cloud Hypervisor's Rust 1.89 minimum.
 ```bash
 rustup toolchain install nightly-2026-09-25 --component rust-src
 cargo install bpf-linker --version 0.11.1 --locked
-cargo +nightly-2026-09-25 build --release --features net_backend_af_xdp
+cargo +nightly-2026-09-25 build --locked --release --features net_backend_af_xdp
 ```
 
-Default builds and CI are unaffected: no CI job enables the feature, and
-`net_util`'s `build.rs` only compiles the eBPF program when the feature is on.
+Default builds do not compile the eBPF program. The `af-xdp` CI job checks the
+feature-enabled workspace and unit tests with both dependency lockfiles fixed.
+It builds the pinned linker from source with Cargo checksum verification.
 
 ## Privilege model (load-then-drop)
 
@@ -48,6 +49,13 @@ Cloud Hypervisor must therefore **start** with `CAP_BPF`, `CAP_NET_ADMIN`, and
 ```bash
 sudo setcap cap_bpf,cap_net_admin,cap_net_raw+ep ./cloud-hypervisor
 ```
+
+Set `RLIMIT_MEMLOCK` high enough before starting the process. Each AF_XDP
+device locks roughly 16 MiB of UMEM, in addition to other locked memory and
+kernel accounting. The file capabilities above do not bypass this limit.
+For example, a service can set `LimitMEMLOCK=infinity`, or a shell with a
+sufficient hard limit can use `ulimit -l unlimited`. A low limit can make UMEM
+registration fail even when all three setup capabilities are present.
 
 The drop happens on the vmm thread before any vCPU or virtio-worker thread is
 spawned. Linux capabilities are per-thread and inherited at thread creation, so
@@ -116,3 +124,6 @@ IOMMU.
   Ethernet. For in-band VLAN tags, reduce the MTU by four bytes per tag.
 - **Memory.** Each queue pair allocates a UMEM of roughly 16 MiB
   (4096 × 4096-byte frames).
+- **Retry policy.** Stalled TX work backs off from 1 ms to a maximum 100 ms
+  interval. Completion or guest-queue progress restores the short interval.
+  RX keeps its independent 1 ms wake retries during the bounded 100 ms window.
