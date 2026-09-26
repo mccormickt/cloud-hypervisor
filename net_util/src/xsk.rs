@@ -51,12 +51,14 @@ pub enum XdpError {
     InvalidTxFrame,
     #[error("AF_XDP frame count exceeds the supported range")]
     InvalidFrameCount,
+    #[error("AF_XDP frame size {0} is unsupported; expected 4096")]
+    InvalidFrameSize(u32),
 }
 
 /// Parameters for building an [`Xsk`].
 #[derive(Clone, Copy, Debug)]
 pub struct XdpSocketConfig {
-    /// UMEM frame size in bytes (aligned-chunk mode).
+    /// UMEM frame size in bytes. This backend requires 4096-byte aligned chunks.
     pub frame_size: u32,
     /// RX ring size (descriptors).
     pub rx_size: u32,
@@ -206,6 +208,22 @@ impl TxPool {
         self.free.push(self.first_frame + index as u32);
         Ok(())
     }
+
+    fn complete_batch(
+        &mut self,
+        drain: impl FnOnce(&mut dyn FnMut(u64)) -> u32,
+    ) -> Result<u32, XdpError> {
+        let mut result = Ok(());
+        let completed = drain(&mut |addr| {
+            // The ring drains the whole batch, even after an invalid entry.
+            // Reclaim later valid entries while preserving the first error.
+            let entry = self.complete(addr);
+            if result.is_ok() {
+                result = entry;
+            }
+        });
+        result.map(|()| completed)
+    }
 }
 
 /// An AF_XDP socket bound to one netdev queue, with its UMEM frame pools.
@@ -239,6 +257,9 @@ impl Xsk {
     /// the FILL ring with the RX frame pool.
     pub fn new(ifindex: u32, queue_id: u32, config: XdpSocketConfig) -> Result<Self, XdpError> {
         let frame_size = config.frame_size;
+        if frame_size != XDP_FRAME_SIZE {
+            return Err(XdpError::InvalidFrameSize(frame_size));
+        }
         let frame_count = config
             .fill_size
             .checked_add(config.tx_size)
@@ -366,14 +387,8 @@ impl Xsk {
 
     /// Reclaims completed TX frames back into the free pool.
     pub fn complete(&mut self) -> Result<u32, XdpError> {
-        let mut result = Ok(());
-        let pool = &mut self.tx_pool;
-        let completed = self.socket.complete(|addr| {
-            if result.is_ok() {
-                result = pool.complete(addr);
-            }
-        });
-        result.map(|()| completed)
+        self.tx_pool
+            .complete_batch(|reclaim| self.socket.complete(reclaim))
     }
 
     /// Whether submitted frames still need completion and possibly a wakeup.
@@ -505,6 +520,41 @@ pub fn iface_mtu(name: &str) -> Result<u16, XdpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_frame_size_fails_before_socket_setup() {
+        for frame_size in [0, 2048, 8192] {
+            let result = Xsk::new(
+                0,
+                0,
+                XdpSocketConfig {
+                    frame_size,
+                    ..Default::default()
+                },
+            );
+            assert!(matches!(result, Err(XdpError::InvalidFrameSize(size)) if size == frame_size));
+        }
+    }
+
+    #[test]
+    fn completion_error_does_not_strand_the_rest_of_the_batch() {
+        let mut pool = TxPool::new(3, 5, 4096);
+        while let Some((_, addr)) = pool.alloc() {
+            let index = pool.allocated_index(addr).unwrap();
+            pool.states[index] = TxFrameState::Inflight;
+            pool.inflight += 1;
+        }
+        pool.complete_batch(|reclaim| {
+            for addr in [4 * 4096, 0, 3 * 4096, 4 * 4096] {
+                reclaim(addr);
+            }
+            4
+        })
+        .unwrap_err();
+        assert_eq!(pool.inflight, 0);
+        assert_eq!(pool.free, [4, 3]);
+        assert_eq!(pool.states, [TxFrameState::Free; 2]);
+    }
 
     #[test]
     fn tx_pool_rejects_wrong_ownership_and_completion_addresses() {
