@@ -3029,7 +3029,7 @@ impl DeviceManager {
         let state = state_from_id(snapshot, id).map_err(DeviceManagerError::RestoreGetState)?;
 
         // `validate` guarantees `xdp_iface` is present for the AF_XDP backend.
-        let xdp_cfg = virtio_devices::net::XdpBackendConfig {
+        let xdp_cfg = net::XdpBackendConfig {
             iface: net_cfg
                 .xdp_iface
                 .clone()

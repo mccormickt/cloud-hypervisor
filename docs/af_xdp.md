@@ -80,6 +80,8 @@ Key parameters:
   Use the default native mode for veth.
 - `xdp_zerocopy=on` — require zero-copy support at bind time. Unsupported
   drivers fail setup; there is no copy-mode fallback. Guest data is still copied.
+  RX wakeups retry for 100 ms after FILL publication. Longer driver/interface
+  failures can require a device reset; real zero-copy NIC validation is required.
 - `num_queues=2` — exactly one RX/TX queue pair is supported. Configure the
   interface to receive on queue 0 (`ethtool -L <iface> combined 1`).
 

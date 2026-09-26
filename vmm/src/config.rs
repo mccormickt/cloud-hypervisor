@@ -1759,7 +1759,7 @@ pub enum ParseNetBackendError {
 impl FromStr for NetBackend {
     type Err = ParseNetBackendError;
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "tap" => Ok(NetBackend::Tap),
             "vhost_user" | "vhost-user" => Ok(NetBackend::VhostUser),

@@ -540,6 +540,8 @@ struct XdpNetEpollHandler<'a> {
     queue_pair: (Queue, Queue),
     queue_evt_pair: (EventFd, EventFd),
     tx_retry_timer: TimerFd,
+    retry_timer_armed: bool,
+    rx_wake_started: bool,
 }
 
 #[cfg(feature = "net_backend_af_xdp")]
@@ -578,6 +580,11 @@ impl XdpNetEpollHandler<'_> {
     }
 
     fn process_tx(&mut self) -> result::Result<(), DeviceError> {
+        // Start the wake retry window after the worker's pause gate.
+        if !self.rx_wake_started {
+            self.net.xsk.retry_rx_wakeup();
+            self.rx_wake_started = true;
+        }
         let res = self
             .net
             .process_tx(&self.mem.memory(), &mut self.queue_pair.1)
@@ -590,12 +597,13 @@ impl XdpNetEpollHandler<'_> {
     }
 
     fn arm_retry_timer(&mut self) -> result::Result<(), DeviceError> {
-        if self.net.needs_tx_retry() {
+        if self.net.needs_tx_retry() && !self.retry_timer_armed {
             self.tx_retry_timer
                 .reset(Duration::from_millis(1), None)
                 .map_err(|e| {
                     DeviceError::XdpQueuePair(net_util::XdpQueuePairError::RetryTimer(e.into()))
                 })?;
+            self.retry_timer_armed = true;
         }
         Ok(())
     }
@@ -665,6 +673,7 @@ impl XdpNetEpollHandler<'_> {
             .reset(Duration::from_millis(1), None)
             .context("Failed to arm AF_XDP TX startup timer")
             .map_err(EpollHelperError::HandleEvent)?;
+        self.retry_timer_armed = true;
         helper.run(paused, paused_sync, self)?;
 
         Ok(())
@@ -704,6 +713,7 @@ impl EpollHelperHandler for XdpNetEpollHandler<'_> {
                     .wait()
                     .context("Failed to read AF_XDP TX retry timer")
                     .map_err(EpollHelperError::HandleEvent)?;
+                self.retry_timer_armed = false;
                 self.process_tx().map_err(|e| {
                     EpollHelperError::HandleEvent(anyhow!("Error retrying XSK TX: {e:?}"))
                 })?;
@@ -767,8 +777,7 @@ pub struct XdpBackendConfig {
     /// Peer interface of a `veth` pair. When set, a pass-through XDP program is
     /// attached to it so AF_XDP redirect works (veth needs XDP on both ends).
     pub peer: Option<String>,
-    /// Force the XDP redirect program to attach in generic (SKB) mode rather
-    /// than native driver mode. Required on `veth` and similar interfaces.
+    /// Request generic (SKB) mode; requires kernel support for FD-owned links.
     pub skb_mode: bool,
     /// Request zero-copy mode at bind time.
     pub zerocopy: bool,
@@ -1275,6 +1284,8 @@ impl Net {
                         kill_evt,
                         pause_evt,
                         tx_retry_timer,
+                        retry_timer_armed: false,
+                        rx_wake_started: false,
                     };
                     handler.run(&paused, paused_sync.as_ref().unwrap())
                 },

@@ -20,6 +20,7 @@
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::{self, NonNull};
+use std::time::{Duration, Instant};
 use std::{io, mem};
 
 use aya::xsk::{XskError, XskSocket, XskSocketConfig, XskUmem, XskUmemConfig};
@@ -32,6 +33,7 @@ use crate::XDP_FRAME_SIZE;
 const XDP_COPY: u16 = 1 << 1;
 const XDP_ZEROCOPY: u16 = 1 << 2;
 const XDP_USE_NEED_WAKEUP: u16 = 1 << 3;
+const RX_WAKE_RETRY_WINDOW: Duration = Duration::from_millis(100);
 
 #[derive(Error, Debug)]
 pub enum XdpError {
@@ -60,8 +62,7 @@ pub struct XdpSocketConfig {
     pub fill_size: u32,
     /// COMPLETION ring size (descriptors).
     pub completion_size: u32,
-    /// Request zero-copy mode. Falls back to copy at bind time on drivers
-    /// without zero-copy support.
+    /// Require zero-copy support; unsupported drivers fail at bind time.
     pub zerocopy: bool,
 }
 
@@ -146,6 +147,8 @@ pub struct Xsk {
     /// Free TX frame indices.
     tx_free: Vec<u32>,
     tx_inflight: u32,
+    zerocopy: bool,
+    rx_wake_deadline: Option<Instant>,
 }
 
 // SAFETY: `Xsk` is moved to exactly one virtio worker thread and accessed only
@@ -205,6 +208,10 @@ impl Xsk {
             rx_pool,
             tx_free,
             tx_inflight: 0,
+            zerocopy: config.zerocopy,
+            rx_wake_deadline: config
+                .zerocopy
+                .then(|| Instant::now() + RX_WAKE_RETRY_WINDOW),
         })
     }
 
@@ -234,6 +241,7 @@ impl Xsk {
             )?;
             self.socket.rx_release(1);
             self.rx_pool.push(index);
+            self.rx_wake_deadline = None;
         }
         Ok(())
     }
@@ -246,6 +254,9 @@ impl Xsk {
             for index in self.rx_pool.drain(..submitted) {
                 self.rx_published[index as usize] = true;
             }
+            if submitted != 0 {
+                self.retry_rx_wakeup();
+            }
         }
         self.socket.wake_rx()?;
         Ok(())
@@ -253,6 +264,18 @@ impl Xsk {
 
     pub fn has_pending_refill(&self) -> bool {
         !self.rx_pool.is_empty()
+            || self
+                .rx_wake_deadline
+                .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    /// Schedule bounded wake retries after publication or worker restart.
+    /// Aya masks transient wake errors, so an empty pool does not prove that
+    /// the driver is awake. RX progress or the deadline ends this retry window.
+    pub fn retry_rx_wakeup(&mut self) {
+        if self.zerocopy {
+            self.rx_wake_deadline = Some(Instant::now() + RX_WAKE_RETRY_WINDOW);
+        }
     }
 
     /// Reclaims completed TX frames back into the free pool.
@@ -392,6 +415,31 @@ pub fn iface_mtu(name: &str) -> Result<u16, XdpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(devcli_testenv)]
+    #[test]
+    fn wake_retry_window_survives_empty_refill_and_expires() {
+        // Exercise scheduling with a copy socket; this does not validate a
+        // real zero-copy driver's wakeup behavior.
+        let mut xsk = Xsk::new(
+            iface_index("xdp-test0").unwrap(),
+            0,
+            XdpSocketConfig::default(),
+        )
+        .unwrap();
+        assert!(!xsk.has_pending_refill());
+        xsk.zerocopy = true;
+        xsk.retry_rx_wakeup();
+        let deadline = xsk.rx_wake_deadline;
+        assert!(xsk.has_pending_refill());
+        xsk.refill().unwrap();
+        assert_eq!(xsk.rx_wake_deadline, deadline);
+        xsk.rx_wake_deadline = Some(Instant::now() - Duration::from_secs(1));
+        xsk.refill().unwrap();
+        assert!(!xsk.has_pending_refill());
+        xsk.retry_rx_wakeup();
+        assert!(xsk.has_pending_refill());
+    }
 
     #[test]
     fn rx_frame_identity_follows_packet_address_not_fill_order() {

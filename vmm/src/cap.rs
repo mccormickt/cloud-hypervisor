@@ -20,6 +20,7 @@
 //! structs, so they are declared here.
 
 use std::cell::Cell;
+use std::env::consts;
 use std::io;
 
 use seccompiler::{SeccompAction, SeccompFilter, apply_filter};
@@ -178,7 +179,7 @@ pub(crate) fn restrict_bpf() -> io::Result<()> {
         [(libc::SYS_bpf, Vec::new())].into(),
         SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
-        std::env::consts::ARCH.try_into().unwrap(),
+        consts::ARCH.try_into().unwrap(),
     )
     .and_then(|filter| filter.try_into())
     .map_err(io::Error::other)?;
@@ -189,17 +190,21 @@ pub(crate) fn restrict_bpf() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
+    #[cfg(feature = "kvm")]
+    use crate::seccomp_filters::{Thread, get_seccomp_filter};
 
     #[test]
     fn capability_drop_and_bpf_filter_are_inherited() {
-        std::thread::spawn(|| {
+        thread::spawn(|| {
             let before = capability_data().unwrap();
             #[cfg(feature = "kvm")]
             {
-                let filter = crate::seccomp_filters::get_seccomp_filter(
+                let filter = get_seccomp_filter(
                     &SeccompAction::Errno(libc::EACCES as u32),
-                    crate::seccomp_filters::Thread::Vmm,
+                    Thread::Vmm,
                     Some(hypervisor::HypervisorType::Kvm),
                 )
                 .unwrap();
@@ -227,7 +232,7 @@ mod tests {
                 assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
             };
             check();
-            std::thread::spawn(check).join().unwrap();
+            thread::spawn(check).join().unwrap();
         })
         .join()
         .unwrap();
@@ -235,7 +240,7 @@ mod tests {
 
     #[test]
     fn bpf_filter_blocks_even_with_setup_capabilities() {
-        std::thread::spawn(|| {
+        thread::spawn(|| {
             let data = capability_data().unwrap();
             if data[1].effective & (1 << (39 - 32)) != 0 {
                 // SAFETY: invalid command, no attribute pointer. A privileged
@@ -286,8 +291,8 @@ mod tests {
         assert_eq!(data[0].inheritable & net_raw_bit, 0);
 
         let dropped_low = net_admin_bit | net_raw_bit | (1 << CAP_SYS_ADMIN) | (1 << CAP_SETPCAP);
-        assert_eq!(data[0].effective, u32::MAX & !dropped_low);
+        assert_eq!(data[0].effective, !dropped_low);
         // No other bit in word 1 was touched: only bit 7 should differ from MAX.
-        assert_eq!(data[1].effective, u32::MAX & !bpf_bit);
+        assert_eq!(data[1].effective, !bpf_bit);
     }
 }

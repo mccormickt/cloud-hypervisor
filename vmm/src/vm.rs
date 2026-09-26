@@ -87,6 +87,8 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+#[cfg(feature = "net_backend_af_xdp")]
+use crate::cap;
 use crate::config::{MemoryRestoreMode, ValidationError, add_to_config};
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -113,8 +115,9 @@ use crate::sev::MeasuredBootInfo;
 #[cfg(feature = "fw_cfg")]
 use crate::vm_config::FwCfgConfig;
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
-    NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetBackend,
+    NetConfig, NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig,
+    VsockConfig,
 };
 use crate::{
     CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemoryMmap,
@@ -620,7 +623,7 @@ impl Vm {
 
         #[cfg(feature = "net_backend_af_xdp")]
         if config.lock().unwrap().has_af_xdp_net() {
-            crate::cap::check_xdp_setup().map_err(Error::AfXdpSetup)?;
+            cap::check_xdp_setup().map_err(Error::AfXdpSetup)?;
         }
 
         info!("Booting VM from config: {config:?}");
@@ -745,9 +748,9 @@ impl Vm {
         {
             let has_xdp = config.lock().unwrap().has_af_xdp_net();
             if has_xdp {
-                crate::cap::drop_xdp_caps().map_err(Error::DropCapabilities)?;
+                cap::drop_xdp_caps().map_err(Error::DropCapabilities)?;
+                cap::restrict_bpf().map_err(Error::DropCapabilities)?;
             }
-            crate::cap::restrict_bpf().map_err(Error::DropCapabilities)?;
             if has_xdp && snapshot.is_some() {
                 device_manager
                     .lock()
@@ -2393,7 +2396,7 @@ impl Vm {
         // The AF_XDP backend loads its BPF program at device creation while CH
         // still holds CAP_BPF/CAP_NET_ADMIN. Those capabilities are dropped once
         // the guest is running, so the backend cannot be hot-plugged.
-        if net_cfg.backend == crate::vm_config::NetBackend::AfXdp {
+        if net_cfg.backend == NetBackend::AfXdp {
             return Err(Error::AfXdpHotplugUnsupported);
         }
 
