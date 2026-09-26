@@ -17,6 +17,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
+#[cfg(feature = "net_backend_af_xdp")]
+use std::time::Instant;
 
 use anyhow::{Context, anyhow};
 use event_monitor::event;
@@ -540,7 +542,7 @@ struct XdpNetEpollHandler<'a> {
     queue_pair: (Queue, Queue),
     queue_evt_pair: (EventFd, EventFd),
     tx_retry_timer: TimerFd,
-    retry_timer_armed: bool,
+    retry_deadline: Option<Instant>,
     rx_wake_started: bool,
 }
 
@@ -597,13 +599,15 @@ impl XdpNetEpollHandler<'_> {
     }
 
     fn arm_retry_timer(&mut self) -> result::Result<(), DeviceError> {
-        if self.net.needs_tx_retry() && !self.retry_timer_armed {
-            self.tx_retry_timer
-                .reset(Duration::from_millis(1), None)
-                .map_err(|e| {
-                    DeviceError::XdpQueuePair(net_util::XdpQueuePairError::RetryTimer(e.into()))
-                })?;
-            self.retry_timer_armed = true;
+        let delay = self.net.retry_delay();
+        let deadline = Instant::now() + delay;
+        // A new RX wake window may shorten a backed-off TX timer. Other
+        // events must never postpone an already scheduled retry.
+        if self.net.needs_tx_retry() && self.retry_deadline.is_none_or(|armed| deadline < armed) {
+            self.tx_retry_timer.reset(delay, None).map_err(|e| {
+                DeviceError::XdpQueuePair(net_util::XdpQueuePairError::RetryTimer(e.into()))
+            })?;
+            self.retry_deadline = Some(deadline);
         }
         Ok(())
     }
@@ -669,11 +673,12 @@ impl XdpNetEpollHandler<'_> {
         }
 
         self.net.epoll_fd = Some(helper.as_raw_fd());
+        let deadline = Instant::now() + Duration::from_millis(1);
         self.tx_retry_timer
             .reset(Duration::from_millis(1), None)
             .context("Failed to arm AF_XDP TX startup timer")
             .map_err(EpollHelperError::HandleEvent)?;
-        self.retry_timer_armed = true;
+        self.retry_deadline = Some(deadline);
         helper.run(paused, paused_sync, self)?;
 
         Ok(())
@@ -713,7 +718,7 @@ impl EpollHelperHandler for XdpNetEpollHandler<'_> {
                     .wait()
                     .context("Failed to read AF_XDP TX retry timer")
                     .map_err(EpollHelperError::HandleEvent)?;
-                self.retry_timer_armed = false;
+                self.retry_deadline = None;
                 self.process_tx().map_err(|e| {
                     EpollHelperError::HandleEvent(anyhow!("Error retrying XSK TX: {e:?}"))
                 })?;
@@ -1284,7 +1289,7 @@ impl Net {
                         kill_evt,
                         pause_evt,
                         tx_retry_timer,
-                        retry_timer_armed: false,
+                        retry_deadline: None,
                         rx_wake_started: false,
                     };
                     handler.run(&paused, paused_sync.as_ref().unwrap())
@@ -2151,6 +2156,52 @@ mod tests {
                 net.xsks.as_ref().unwrap()[0].lock().unwrap().as_raw_fd(),
                 socket_fd
             );
+        }
+
+        let mut xsk = net.xsks.as_ref().unwrap()[0].lock().unwrap();
+        for _ in 0..1000 {
+            xsk.kick().unwrap();
+            xsk.complete().unwrap();
+            if !xsk.has_pending_tx() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!xsk.has_pending_tx());
+        let (_, addr) = xsk.tx_alloc().unwrap();
+        xsk.tx_frame_mut(addr, 60).unwrap().fill(0xff);
+        assert!(xsk.transmit(addr, 60).unwrap());
+        let memory = mem.memory();
+        let rx = VirtQueue::new(GuestAddress(0x70_0000), &*memory, 256);
+        let tx = VirtQueue::new(GuestAddress(0x80_0000), &*memory, 256);
+        let mut handler = XdpNetEpollHandler {
+            net: XdpQueuePair::new(&mut xsk, NetCounters::default(), 0, None, None, None),
+            mem: mem.clone(),
+            interrupt_cb: Arc::new(TestInterrupt::new()),
+            kill_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            pause_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            queue_index_base: 0,
+            queue_pair: (rx.create_queue(), tx.create_queue()),
+            queue_evt_pair: (
+                EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            ),
+            tx_retry_timer: TimerFd::new().unwrap(),
+            retry_deadline: None,
+            rx_wake_started: true,
+        };
+        handler
+            .tx_retry_timer
+            .reset(Duration::from_millis(100), None)
+            .unwrap();
+        let delayed = Instant::now() + Duration::from_millis(100);
+        handler.retry_deadline = Some(delayed);
+        handler.arm_retry_timer().unwrap();
+        let earlier = handler.retry_deadline.unwrap();
+        assert!(earlier < delayed);
+        for _ in 0..10 {
+            handler.arm_retry_timer().unwrap();
+            assert_eq!(handler.retry_deadline, Some(earlier));
         }
     }
 

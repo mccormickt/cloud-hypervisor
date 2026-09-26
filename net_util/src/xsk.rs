@@ -47,6 +47,10 @@ pub enum XdpError {
     Interface(#[source] io::Error),
     #[error("RX descriptor is outside its UMEM frame pool")]
     InvalidRxFrame,
+    #[error("TX frame address or ownership is invalid")]
+    InvalidTxFrame,
+    #[error("AF_XDP frame count exceeds the supported range")]
+    InvalidFrameCount,
 }
 
 /// Parameters for building an [`Xsk`].
@@ -128,6 +132,82 @@ impl Drop for MmapRegion {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxFrameState {
+    Free,
+    Allocated,
+    Inflight,
+}
+
+/// TX ownership is separate from the RX pool and follows completion identity.
+struct TxPool {
+    first_frame: u32,
+    frame_size: u32,
+    states: Vec<TxFrameState>,
+    free: Vec<u32>,
+    inflight: u32,
+}
+
+impl TxPool {
+    fn new(first_frame: u32, end_frame: u32, frame_size: u32) -> Self {
+        Self {
+            first_frame,
+            frame_size,
+            states: vec![TxFrameState::Free; (end_frame - first_frame) as usize],
+            free: (first_frame..end_frame).collect(),
+            inflight: 0,
+        }
+    }
+
+    fn index(&self, addr: u64) -> Result<usize, XdpError> {
+        let size = u64::from(self.frame_size);
+        if !addr.is_multiple_of(size) {
+            return Err(XdpError::InvalidTxFrame);
+        }
+        let index = (addr / size)
+            .checked_sub(u64::from(self.first_frame))
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < self.states.len())
+            .ok_or(XdpError::InvalidTxFrame)?;
+        Ok(index)
+    }
+
+    fn allocated_index(&self, addr: u64) -> Result<usize, XdpError> {
+        let index = self.index(addr)?;
+        if self.states[index] != TxFrameState::Allocated {
+            return Err(XdpError::InvalidTxFrame);
+        }
+        Ok(index)
+    }
+
+    fn alloc(&mut self) -> Option<(u32, u64)> {
+        let frame = self.free.pop()?;
+        self.states[(frame - self.first_frame) as usize] = TxFrameState::Allocated;
+        Some((frame, u64::from(frame) * u64::from(self.frame_size)))
+    }
+
+    fn recycle(&mut self, frame: u32) -> Result<(), XdpError> {
+        let index = self.allocated_index(u64::from(frame) * u64::from(self.frame_size))?;
+        self.states[index] = TxFrameState::Free;
+        self.free.push(frame);
+        Ok(())
+    }
+
+    fn complete(&mut self, addr: u64) -> Result<(), XdpError> {
+        let index = self.index(addr)?;
+        if self.states[index] != TxFrameState::Inflight {
+            return Err(XdpError::InvalidTxFrame);
+        }
+        self.inflight = self
+            .inflight
+            .checked_sub(1)
+            .ok_or(XdpError::InvalidTxFrame)?;
+        self.states[index] = TxFrameState::Free;
+        self.free.push(self.first_frame + index as u32);
+        Ok(())
+    }
+}
+
 /// An AF_XDP socket bound to one netdev queue, with its UMEM frame pools.
 ///
 /// Frames `[0, fill_size)` form the RX pool (cycled FILL → RX → FILL); frames
@@ -144,9 +224,7 @@ pub struct Xsk {
     rx_published: Vec<bool>,
     /// RX frames the caller has reclaimed and not yet returned to FILL.
     rx_pool: Vec<u32>,
-    /// Free TX frame indices.
-    tx_free: Vec<u32>,
-    tx_inflight: u32,
+    tx_pool: TxPool,
     zerocopy: bool,
     rx_wake_deadline: Option<Instant>,
 }
@@ -161,7 +239,10 @@ impl Xsk {
     /// the FILL ring with the RX frame pool.
     pub fn new(ifindex: u32, queue_id: u32, config: XdpSocketConfig) -> Result<Self, XdpError> {
         let frame_size = config.frame_size;
-        let frame_count = config.fill_size + config.tx_size;
+        let frame_count = config
+            .fill_size
+            .checked_add(config.tx_size)
+            .ok_or(XdpError::InvalidFrameCount)?;
         let len = frame_count as usize * frame_size as usize;
 
         let umem_mem = MmapRegion::new(len)?;
@@ -192,9 +273,12 @@ impl Xsk {
         let mut socket = XskSocket::new(umem, ifindex, queue_id, socket_config)?;
 
         let rx_frames: Vec<u32> = (0..config.fill_size).collect();
-        let tx_free: Vec<u32> = (config.fill_size..frame_count).collect();
+        let tx_pool = TxPool::new(config.fill_size, frame_count, frame_size);
 
-        let submitted = socket.fill(rx_frames.iter().copied())? as usize;
+        // SAFETY: these distinct RX frames have never been published and are
+        // disjoint from the TX pool. Only the submitted prefix becomes owned
+        // by the kernel; the rest remains in rx_pool.
+        let submitted = unsafe { socket.fill(rx_frames.iter().copied()) }? as usize;
         let rx_pool = rx_frames[submitted..].to_vec();
         let mut rx_published = vec![false; config.fill_size as usize];
         rx_published[..submitted].fill(true);
@@ -206,8 +290,7 @@ impl Xsk {
             frame_size,
             rx_published,
             rx_pool,
-            tx_free,
-            tx_inflight: 0,
+            tx_pool,
             zerocopy: config.zerocopy,
             rx_wake_deadline: config
                 .zerocopy
@@ -247,7 +330,11 @@ impl Xsk {
     /// required (zero-copy + need-wakeup mode).
     pub fn refill(&mut self) -> Result<(), XdpError> {
         if !self.rx_pool.is_empty() {
-            let submitted = self.socket.fill(self.rx_pool.iter().copied())? as usize;
+            // SAFETY: rx_release validates pool membership and rejects
+            // duplicate ownership before adding a frame. Submitted frames
+            // are removed, so rx_pool contains only distinct caller-owned
+            // frames, with no packet borrow alive across this mutable call.
+            let submitted = unsafe { self.socket.fill(self.rx_pool.iter().copied()) }? as usize;
             for index in self.rx_pool.drain(..submitted) {
                 self.rx_published[index as usize] = true;
             }
@@ -260,10 +347,12 @@ impl Xsk {
     }
 
     pub fn has_pending_refill(&self) -> bool {
-        !self.rx_pool.is_empty()
-            || self
-                .rx_wake_deadline
-                .is_some_and(|deadline| Instant::now() < deadline)
+        !self.rx_pool.is_empty() || self.rx_wakeup_pending()
+    }
+
+    pub(crate) fn rx_wakeup_pending(&self) -> bool {
+        self.rx_wake_deadline
+            .is_some_and(|deadline| Instant::now() < deadline)
     }
 
     /// Schedule bounded wake retries after publication or worker restart.
@@ -276,45 +365,58 @@ impl Xsk {
     }
 
     /// Reclaims completed TX frames back into the free pool.
-    pub fn complete(&mut self) -> u32 {
-        let Self {
-            socket,
-            tx_free,
-            frame_size,
-            ..
-        } = self;
-        let frame_size = u64::from(*frame_size);
-        let completed = socket.complete(|addr| tx_free.push((addr / frame_size) as u32));
-        self.tx_inflight -= completed;
-        completed
+    pub fn complete(&mut self) -> Result<u32, XdpError> {
+        let mut result = Ok(());
+        let pool = &mut self.tx_pool;
+        let completed = self.socket.complete(|addr| {
+            if result.is_ok() {
+                result = pool.complete(addr);
+            }
+        });
+        result.map(|()| completed)
     }
 
     /// Whether submitted frames still need completion and possibly a wakeup.
     pub fn has_pending_tx(&self) -> bool {
-        self.tx_inflight != 0
+        self.tx_pool.inflight != 0
     }
 
     /// Pops a free TX frame, returning its `(index, umem_addr)`.
     pub fn tx_alloc(&mut self) -> Option<(u32, u64)> {
-        let index = self.tx_free.pop()?;
-        let addr = self.socket.umem().frame_addr(index).ok()?;
-        Some((index, addr))
+        self.tx_pool.alloc()
     }
 
     /// Returns a free TX frame to the pool (e.g. when the TX ring was full).
-    pub fn tx_recycle(&mut self, index: u32) {
-        self.tx_free.push(index);
+    pub fn tx_recycle(&mut self, index: u32) -> Result<(), XdpError> {
+        self.tx_pool.recycle(index)
     }
 
     /// A mutable view of the UMEM frame at `addr` for `len` bytes.
     pub fn tx_frame_mut(&mut self, addr: u64, len: u32) -> Option<&mut [u8]> {
-        self.socket.tx_frame_mut(addr, len)
+        self.tx_pool.allocated_index(addr).ok()?;
+        if len > self.frame_size {
+            return None;
+        }
+        // SAFETY: the ledger proves this aligned TX frame is caller-owned,
+        // not RX or inflight. The range fits one frame, and &mut self prevents
+        // publication or another borrow while the returned slice is alive.
+        unsafe { self.socket.tx_frame_mut(addr, len) }
     }
 
     /// Enqueues one frame on the TX ring. Returns `false` if the ring was full.
     pub fn transmit(&mut self, addr: u64, len: u32) -> Result<bool, XdpError> {
-        let submitted = self.socket.transmit([(addr, len)])?;
-        self.tx_inflight += submitted;
+        let index = self.tx_pool.allocated_index(addr)?;
+        if len == 0 || len > self.frame_size {
+            return Err(XdpError::InvalidTxFrame);
+        }
+        // SAFETY: this single aligned frame is allocated and caller-owned.
+        // The mutable receiver excludes live packet borrows. A successful
+        // submission becomes Inflight and cannot be reused before completion.
+        let submitted = unsafe { self.socket.transmit([(addr, len)]) }?;
+        if submitted == 1 {
+            self.tx_pool.states[index] = TxFrameState::Inflight;
+            self.tx_pool.inflight += 1;
+        }
         Ok(submitted == 1)
     }
 
@@ -403,6 +505,54 @@ pub fn iface_mtu(name: &str) -> Result<u16, XdpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tx_pool_rejects_wrong_ownership_and_completion_addresses() {
+        let mut pool = TxPool::new(3, 6, 4096);
+        for addr in [0, 2 * 4096, 6 * 4096, 5 * 4096 + 1, u64::MAX] {
+            assert!(pool.complete(addr).is_err());
+            pool.allocated_index(addr).unwrap_err();
+        }
+        assert!(pool.complete(5 * 4096).is_err());
+        let (frame, addr) = pool.alloc().unwrap();
+        assert_eq!((frame, addr), (5, 5 * 4096));
+        assert!(pool.complete(addr).is_err());
+        let index = pool.allocated_index(addr).unwrap();
+        pool.states[index] = TxFrameState::Inflight;
+        pool.inflight = 1;
+        pool.allocated_index(addr).unwrap_err();
+        assert!(pool.recycle(frame).is_err());
+        assert!(pool.complete(addr + 256).is_err());
+        assert_eq!(pool.inflight, 1);
+        pool.complete(addr).unwrap();
+        assert!(pool.complete(addr).is_err());
+        assert_eq!(pool.inflight, 0);
+        assert_eq!(pool.free.len(), 3);
+        let (frame, _) = pool.alloc().unwrap();
+        pool.recycle(frame).unwrap();
+        assert!(pool.recycle(frame).is_err());
+        assert_eq!(pool.free.len(), 3);
+    }
+
+    #[test]
+    fn tx_pool_conserves_frames_across_out_of_order_completions() {
+        let mut pool = TxPool::new(2, 5, 4096);
+        for _ in 0..10 {
+            let mut addresses = Vec::new();
+            while let Some((_, addr)) = pool.alloc() {
+                let index = pool.allocated_index(addr).unwrap();
+                pool.states[index] = TxFrameState::Inflight;
+                pool.inflight += 1;
+                addresses.push(addr);
+            }
+            assert_eq!(addresses.len(), 3);
+            for index in [1, 2, 0] {
+                pool.complete(addresses[index]).unwrap();
+            }
+            assert_eq!(pool.inflight, 0);
+            assert_eq!(pool.states, [TxFrameState::Free; 3]);
+        }
+    }
 
     #[cfg(devcli_testenv)]
     #[test]

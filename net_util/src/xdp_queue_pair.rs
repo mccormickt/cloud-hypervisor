@@ -24,6 +24,7 @@ use std::num::Wrapping;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use log::error;
 use rate_limiter::{RateLimiter, TokenType};
@@ -88,6 +89,7 @@ pub struct XdpQueuePair<'a> {
     pub tx_rate_limiter: Option<RateLimiter>,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
     tx_deferred: bool,
+    retry_delay: Duration,
 }
 
 impl<'a> XdpQueuePair<'a> {
@@ -114,6 +116,7 @@ impl<'a> XdpQueuePair<'a> {
             tx_rate_limiter,
             access_platform,
             tx_deferred: false,
+            retry_delay: Duration::from_millis(1),
         }
     }
 
@@ -190,7 +193,8 @@ impl<'a> XdpQueuePair<'a> {
         self.tx_deferred = false;
 
         // Reclaim TX frames the kernel has finished with before sending more.
-        self.xsk.complete();
+        let completed = self.xsk.complete()?;
+        let used_before = queue.next_used();
         self.xsk.refill()?;
 
         let mut processed = 0;
@@ -233,7 +237,7 @@ impl<'a> XdpQueuePair<'a> {
 
                 let mut packet = vec![0u8; total];
                 if let Err(e) = read_segments(mem, &segments, &mut packet) {
-                    self.xsk.tx_recycle(frame_index);
+                    self.xsk.tx_recycle(frame_index)?;
                     queue
                         .add_used(mem, head_index, 0)
                         .map_err(XdpQueuePairError::QueueAddUsed)?;
@@ -249,7 +253,7 @@ impl<'a> XdpQueuePair<'a> {
                 frame.copy_from_slice(payload);
 
                 if !self.xsk.transmit(addr, payload_len as u32)? {
-                    self.xsk.tx_recycle(frame_index);
+                    self.xsk.tx_recycle(frame_index)?;
                     self.tx_deferred = true;
                     queue.go_to_previous_position();
                     break;
@@ -293,6 +297,11 @@ impl<'a> XdpQueuePair<'a> {
         self.tx_counter_bytes = Wrapping(0);
         self.tx_counter_frames = Wrapping(0);
 
+        self.retry_delay = next_retry_delay(
+            self.retry_delay,
+            completed != 0 || queue.next_used() != used_before || !self.needs_tx_retry(),
+        );
+
         queue
             .needs_notification(mem)
             .map_err(XdpQueuePairError::QueueNeedsNotification)
@@ -301,6 +310,15 @@ impl<'a> XdpQueuePair<'a> {
     /// Retry deferred descriptors and kernel wakeups without a new guest kick.
     pub fn needs_tx_retry(&self) -> bool {
         self.tx_deferred || self.xsk.has_pending_tx() || self.xsk.has_pending_refill()
+    }
+
+    /// Back off stalled TX while preserving the independent RX wake window.
+    pub fn retry_delay(&self) -> Duration {
+        if self.xsk.rx_wakeup_pending() {
+            Duration::from_millis(1)
+        } else {
+            self.retry_delay
+        }
     }
 
     pub fn process_rx<B: Bitmap + 'static>(
@@ -475,6 +493,14 @@ fn write_rx_frame<B: Bitmap + 'static>(
     Ok(off as u32)
 }
 
+fn next_retry_delay(previous: Duration, progress: bool) -> Duration {
+    if progress {
+        Duration::from_millis(1)
+    } else {
+        (previous * 2).min(Duration::from_millis(100))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
@@ -483,6 +509,18 @@ mod tests {
 
     fn test_mem() -> GuestMemoryMmap<()> {
         GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap()
+    }
+
+    #[test]
+    fn retry_backoff_is_capped_and_progress_restores_low_latency() {
+        let mut delay = Duration::from_millis(1);
+        for expected in [2, 4, 8, 16, 32, 64, 100, 100, 100] {
+            delay = next_retry_delay(delay, false);
+            assert_eq!(delay, Duration::from_millis(expected));
+        }
+        delay = next_retry_delay(delay, true);
+        assert_eq!(delay, Duration::from_millis(1));
+        assert_eq!(next_retry_delay(delay, false), Duration::from_millis(2));
     }
 
     #[test]
