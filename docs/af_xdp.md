@@ -13,9 +13,14 @@ which needs a **nightly** toolchain (with `rust-src`) and
 require Rust 1.98 or newer for host code; the nightly below meets that requirement.
 Builds without this feature retain Cloud Hypervisor's Rust 1.89 minimum.
 
+Source installation of this linker requires LLVM 23 development libraries.
+On Ubuntu, install `llvm-23-dev` and `libclang-23-dev` from
+[apt.llvm.org](https://apt.llvm.org/), then set `LLVM_PREFIX=/usr/lib/llvm-23`
+for `cargo install`. LLVM must match the nightly compiler's LLVM major version.
+
 ```bash
 rustup toolchain install nightly-2026-09-25 --component rust-src
-cargo install bpf-linker --version 0.11.1 --locked
+LLVM_PREFIX=/usr/lib/llvm-23 cargo +nightly-2026-09-25 install bpf-linker --version 0.11.1 --locked
 cargo +nightly-2026-09-25 build --locked --release --features net_backend_af_xdp
 ```
 
