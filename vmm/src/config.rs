@@ -1844,7 +1844,7 @@ impl NetConfig {
             .convert("num_queues")
             .map_err(Error::ParseNetwork)?
             .unwrap_or_else(default_netconfig_num_queues);
-        let mut vhost_user = parser
+        let vhost_user = parser
             .convert::<Toggle>("vhost_user")
             .map_err(Error::ParseNetwork)?
             .unwrap_or(Toggle(false))
@@ -1866,20 +1866,10 @@ impl NetConfig {
             .map_err(Error::ParseNetwork)?
             .unwrap_or(Toggle(false))
             .0;
-        // Resolve the backend selector. `backend=` is authoritative; the legacy
-        // `vhost_user=on` flag maps to `NetBackend::VhostUser`, and selecting the
-        // vhost-user backend keeps `vhost_user` true so the existing device path
-        // and validation rules apply unchanged.
-        let mut backend = parser
+        let backend = parser
             .convert::<NetBackend>("backend")
             .map_err(Error::ParseNetwork)?
             .unwrap_or_default();
-        if vhost_user && backend == NetBackend::Tap {
-            backend = NetBackend::VhostUser;
-        }
-        if backend == NetBackend::VhostUser {
-            vhost_user = true;
-        }
         let fds = parser
             .convert::<IntegerList>("fd")
             .map_err(Error::ParseNetwork)?
@@ -4797,7 +4787,6 @@ mod tests {
                 "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock"
             )?,
             NetConfig {
-                backend: NetBackend::VhostUser,
                 vhost_user: true,
                 vhost_socket: Some("/tmp/sock".to_owned()),
                 ..net_fixture()
@@ -4811,7 +4800,6 @@ mod tests {
             )?,
             NetConfig {
                 backend: NetBackend::VhostUser,
-                vhost_user: true,
                 vhost_socket: Some("/tmp/sock".to_owned()),
                 ..net_fixture()
             }
@@ -7544,6 +7532,30 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     Err(ValidationError::XdpMultiqueueNotSupported)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn net_backend_cli_json_parity() {
+        for (cli, json, vhost_user) in [
+            ("", r#"{}"#, false),
+            ("vhost_user=on", r#"{"vhost_user":true}"#, true),
+            ("backend=vhost_user", r#"{"backend":"vhost_user"}"#, true),
+            (
+                "backend=vhost_user,vhost_user=off",
+                r#"{"backend":"vhost_user","vhost_user":false}"#,
+                true,
+            ),
+            (
+                "backend=tap,vhost_user=on",
+                r#"{"backend":"tap","vhost_user":true}"#,
+                true,
+            ),
+        ] {
+            let cli = NetConfig::parse(cli).unwrap();
+            let json: NetConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(cli, json);
+            assert_eq!(cli.is_vhost_user(), vhost_user);
         }
     }
 
