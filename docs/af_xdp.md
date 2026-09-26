@@ -12,9 +12,9 @@ which needs a **nightly** toolchain (with `rust-src`) and
 [`bpf-linker`](https://github.com/aya-rs/bpf-linker):
 
 ```bash
-rustup toolchain install nightly --component rust-src
-cargo install bpf-linker
-cargo +nightly build --release --features net_backend_af_xdp
+rustup toolchain install nightly-2026-09-25 --component rust-src
+cargo install bpf-linker --version 0.11.1 --locked
+cargo +nightly-2026-09-25 build --release --features net_backend_af_xdp
 ```
 
 Default builds and CI are unaffected: no CI job enables the feature, and
@@ -22,16 +22,16 @@ Default builds and CI are unaffected: no CI job enables the feature, and
 
 ## Privilege model (load-then-drop)
 
-Cloud Hypervisor loads the XDP redirect program **itself** and drops the
-root-equivalent capabilities before the guest runs. There is no second process,
+Cloud Hypervisor loads the XDP redirect program **itself** and removes setup
+capabilities from the VMM thread before the guest runs. There is no second process,
 no `SCM_RIGHTS` handoff, and no control socket.
 
 | Phase | Operation | Capability |
 |---|---|---|
 | Device creation (`Vm::new`) | Load + attach the XDP redirect program, create `xsks_map` | `CAP_BPF` + `CAP_NET_ADMIN` |
 | Device creation (`Vm::new`) | Create/bind one XSK per queue, insert each into `xsks_map` | `CAP_NET_RAW` |
-| Boot (`Vm::boot`, before vCPUs) | Drop `CAP_BPF` + `CAP_NET_ADMIN`, retain `CAP_NET_RAW` | — |
-| Running guest | Drive the rings (copy datapath) | `CAP_NET_RAW` |
+| End of device creation, including restore | Drop `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_SYS_ADMIN`, and `CAP_SETPCAP`; deny `bpf()` | — |
+| Running guest | Drive the existing rings (copy datapath) | None |
 
 The XDP/BPF program is built from source ([`net_util/xdp-ebpf`](../net_util/xdp-ebpf))
 and embedded in the binary. It is loaded with [`aya`](https://github.com/aya-rs/aya).
@@ -49,19 +49,22 @@ sudo setcap cap_bpf,cap_net_admin,cap_net_raw+ep ./cloud-hypervisor
 
 The drop happens on the vmm thread before any vCPU or virtio-worker thread is
 spawned. Linux capabilities are per-thread and inherited at thread creation, so
-those guest-facing threads start with the reduced set, and `CAP_BPF`/
-`CAP_NET_ADMIN` are also removed from the bounding set.
+those guest-facing threads start with the reduced set. Bounding-set removal is
+also done when `CAP_SETPCAP` is available. Otherwise, clearing the permitted and
+inheritable sets and setting `no_new_privs` prevents privilege gain through exec.
+A second seccomp filter denies all `bpf()` operations, including map updates
+through existing FDs, even when the normal seccomp mode is disabled.
+Restore defers virtio activation until this restriction is in place.
 
 > **Residual limitation.** The drop is per-thread on the vmm thread. Long-lived
-> helper threads already running at that point — the event monitor, the signal
-> handler, and the HTTP/D-Bus API threads — keep their capabilities. They are
-> not guest-controlled. A full process-wide drop (signalling every thread to
-> `capset`) is a follow-up.
+> helper threads already running at that point retain their capabilities and
+> open FDs. This includes API, event, signal, and some constructor-created
+> helper threads. This is not process-wide privilege separation.
 
 ## Usage
 
 ```
---net backend=xdp,xdp_iface=<host_if>,mac=<mac>[,num_queues=<2N>][,xdp_skb=on][,xdp_zerocopy=on]
+--net backend=xdp,xdp_iface=<host_if>,mac=<mac>[,xdp_zerocopy=on]
 ```
 
 Key parameters:
@@ -72,15 +75,17 @@ Key parameters:
 - `xdp_peer=<veth_peer>` — peer interface of a `veth` pair. AF_XDP redirect on
   `veth` only works when **both** ends have an XDP program, so CH attaches a
   pass-through program to the peer. Leave unset for a real NIC.
-- `xdp_skb=on` — force the redirect program to attach in generic (SKB) mode
-  instead of native driver mode. Required on `veth` and other interfaces without
-  native XDP support. Default (`off`) tries native mode and falls back to SKB.
-- `xdp_zerocopy=on` — request zero-copy mode; falls back to copy mode at bind
-  time on drivers without zero-copy support.
-- `num_queues=<2N>` — one XSK is bound per NIC hardware queue using queue ids
-  `0..N`. The interface must expose that many combined queues
-  (`ethtool -L <iface> combined N`); otherwise frames land on queues with no XSK
-  and are passed up the normal stack (`XDP_PASS`).
+- `xdp_skb=on` — request generic (SKB) mode. Only FD-owned XDP links are
+  supported; kernels that require legacy netlink attachment reject setup.
+  Use the default native mode for veth.
+- `xdp_zerocopy=on` — require zero-copy support at bind time. Unsupported
+  drivers fail setup; there is no copy-mode fallback. Guest data is still copied.
+- `num_queues=2` — exactly one RX/TX queue pair is supported. Configure the
+  interface to receive on queue 0 (`ethtool -L <iface> combined 1`).
+
+Use a **dedicated interface**. Every packet on queue 0 is redirected to the
+guest, with no MAC/IP classification. The guest can also transmit arbitrary L2
+frames. Packets on other queues pass to the host; they do not reach the guest.
 
 `backend=xdp` cannot be combined with `tap`, `fd`, `vhost_user`, or a virtual
 IOMMU.
@@ -93,10 +98,17 @@ IOMMU.
   program and XSKs at `Vm::new` (capabilities still held); **live migration is
   refused** (in-flight ring state and the kernel-attached program cannot be
   transferred).
+- **Process lifecycle.** Guest virtio reset reuses the existing sockets. Full
+  VM reboot or another AF_XDP VM requires a fresh VMM process. Capability
+  removal is permanent and can also prevent later TAP/network hotplug.
+- **Attachment.** FD-owned links are required, so closing them detaches without
+  setup privileges. Legacy netlink-only attachment is unsupported.
 - **No offloads.** AF_XDP delivers raw L2 frames, so no checksum/TSO/UFO
-  features are advertised. Bulk TCP throughput is typically below TAP-with-TSO,
-  while small-packet (PPS) rates are competitive or better.
+  features are advertised. Performance gains have not been established by the
+  included tests; compare against TAP with representative workloads.
 - **MTU.** The aligned-chunk UMEM frame size (4096 bytes) bounds the MTU at
-  4082; jumbo frames are unsupported.
+  3826 after kernel RX headroom and the Ethernet header. Both host and guest
+  MTUs must fit; jumbo frames are unsupported. This ceiling is for untagged
+  Ethernet. For in-band VLAN tags, reduce the MTU by four bytes per tag.
 - **Memory.** Each queue pair allocates a UMEM of roughly 16 MiB
   (4096 × 4096-byte frames).

@@ -178,6 +178,7 @@ pub(crate) fn performance_net_throughput(control: &PerformanceTestControl) -> f6
 /// (torn down on drop) and binds CH's AF_XDP sockets to one end while the host
 /// IP lives on the peer. Requires the `cloud-hypervisor` binary to be built with
 /// the `net_backend_af_xdp` feature (see `EXTRA_FEATURES` in `run_metrics.sh`).
+#[cfg(feature = "net_backend_af_xdp")]
 pub(crate) fn performance_net_throughput_xdp(control: &PerformanceTestControl) -> f64 {
     let test_timeout = control.test_timeout;
     let (rx, bandwidth) = control.net_control.unwrap();
@@ -214,7 +215,7 @@ pub(crate) fn performance_net_throughput_xdp(control: &PerformanceTestControl) -
         .spawn()
         .unwrap();
 
-    let r = std::panic::catch_unwind(|| {
+    let r = panic::catch_unwind(|| {
         guest.wait_vm_boot().unwrap();
         measure_virtio_net_throughput(test_timeout, queue_pairs, &guest, rx, bandwidth).unwrap()
     });

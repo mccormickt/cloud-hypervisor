@@ -46,7 +46,7 @@ fn build_xdp_ebpf() {
             no_default_features: false,
             features: &[],
         }],
-        Toolchain::default(),
+        Toolchain::Custom("nightly-2026-09-25"),
     )
     .expect("failed to build xdp-ebpf");
 }

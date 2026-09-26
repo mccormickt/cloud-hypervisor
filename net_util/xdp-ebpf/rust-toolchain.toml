@@ -3,5 +3,5 @@
 # bpf-linker`). Only needed when building `net_util` with the
 # `net_backend_af_xdp` feature.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-09-25"
 components = ["rust-src"]

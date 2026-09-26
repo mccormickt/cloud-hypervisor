@@ -32,12 +32,12 @@ fi
 if [ -n "$EXTRA_FEATURES" ]; then
     build_features="$build_features,$EXTRA_FEATURES"
     if [[ "$EXTRA_FEATURES" == *"net_backend_af_xdp"* ]]; then
-        if ! rustup toolchain list 2>/dev/null | grep -q nightly; then
-            echo "net_backend_af_xdp requires nightly: rustup toolchain install nightly --component rust-src"
+        if ! rustup toolchain list 2>/dev/null | grep -q nightly-2026-09-25; then
+            echo "net_backend_af_xdp requires: rustup toolchain install nightly-2026-09-25 --component rust-src"
             exit 1
         fi
         if ! command -v bpf-linker >/dev/null 2>&1; then
-            echo "net_backend_af_xdp requires bpf-linker: cargo install bpf-linker"
+            echo "net_backend_af_xdp requires: cargo install bpf-linker --version 0.11.1 --locked"
             exit 1
         fi
     fi
