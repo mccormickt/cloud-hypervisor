@@ -268,6 +268,33 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Formatting (fuzz) (rustfmt)
         run: cargo fmt --all --manifest-path fuzz/Cargo.toml -- --check
+  af-xdp:
+    name: af-xdp
+    needs: [preflight]
+    if: needs.preflight.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2026-09-25
+          components: rust-src
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get -yqq install build-essential libssl-dev pkg-config
+      - name: Build pinned BPF linker from source
+        run: |
+          set -eufo pipefail
+          cargo install bpf-linker --version 0.11.1 --locked
+          test "$(bpf-linker --version)" = 'bpf-linker 0.11.1'
+      - name: Check AF_XDP workspace
+        run: cargo check --locked --workspace --all-targets --features kvm,net_backend_af_xdp
+      - name: Test AF_XDP units
+        run: cargo test --locked -p net_util -p virtio-devices --lib --features kvm,net_backend_af_xdp
+      - name: Check lockfile integrity
+        run: git diff --exit-code -- Cargo.lock net_util/xdp-ebpf/Cargo.lock
   package-consistency:
     name: package-consistency
     needs: [preflight]
@@ -1003,6 +1030,7 @@ jobs:
   all-green:
     name: all-green
     needs:
+      - af-xdp
       - audit
       - build
       - build-riscv64

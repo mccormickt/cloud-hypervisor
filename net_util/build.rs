@@ -8,8 +8,7 @@
 //! When the `net_backend_af_xdp` feature is enabled, this compiles the
 //! standalone `xdp-ebpf` crate to a BPF object that is embedded into the binary
 //! at compile time (see `src/bpf.rs`). The heavy work is gated on the feature so
-//! default builds — and CI, which never enables it — need neither a nightly
-//! toolchain nor `bpf-linker`.
+//! default builds need neither a nightly toolchain nor `bpf-linker`.
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(fuzzing)");
