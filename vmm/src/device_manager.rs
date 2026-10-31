@@ -5028,6 +5028,7 @@ impl DeviceManager {
                 dma_handler,
                 Arc::clone(&self.pending_activations),
                 vm_migration::snapshot_from_id(snapshot, id.as_str()),
+                false,
             )
             .map_err(DeviceManagerError::VirtioDevice)?,
         ));
