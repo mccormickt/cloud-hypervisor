@@ -11,7 +11,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "aya-build"
 version = "0.2.1"
-source = "git+https://github.com/mccormickt/aya?rev=e875aa8ffe65baa10b40f729776e0452de2e23c1#e875aa8ffe65baa10b40f729776e0452de2e23c1"
+source = "git+https://github.com/mccormickt/aya?rev=3fdc839683437f78972ebc0840708a94008c20db#3fdc839683437f78972ebc0840708a94008c20db"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -22,7 +22,7 @@ dependencies = [
 [[package]]
 name = "aya-ebpf"
 version = "0.3.0"
-source = "git+https://github.com/mccormickt/aya?rev=e875aa8ffe65baa10b40f729776e0452de2e23c1#e875aa8ffe65baa10b40f729776e0452de2e23c1"
+source = "git+https://github.com/mccormickt/aya?rev=3fdc839683437f78972ebc0840708a94008c20db#3fdc839683437f78972ebc0840708a94008c20db"
 dependencies = [
  "aya-build",
  "aya-ebpf-bindings",
@@ -34,7 +34,7 @@ dependencies = [
 [[package]]
 name = "aya-ebpf-bindings"
 version = "0.3.0"
-source = "git+https://github.com/mccormickt/aya?rev=e875aa8ffe65baa10b40f729776e0452de2e23c1#e875aa8ffe65baa10b40f729776e0452de2e23c1"
+source = "git+https://github.com/mccormickt/aya?rev=3fdc839683437f78972ebc0840708a94008c20db#3fdc839683437f78972ebc0840708a94008c20db"
 dependencies = [
  "aya-build",
  "aya-ebpf-cty",
@@ -43,7 +43,7 @@ dependencies = [
 [[package]]
 name = "aya-ebpf-cty"
 version = "0.4.0"
-source = "git+https://github.com/mccormickt/aya?rev=e875aa8ffe65baa10b40f729776e0452de2e23c1#e875aa8ffe65baa10b40f729776e0452de2e23c1"
+source = "git+https://github.com/mccormickt/aya?rev=3fdc839683437f78972ebc0840708a94008c20db#3fdc839683437f78972ebc0840708a94008c20db"
 dependencies = [
  "aya-build",
 ]
@@ -51,7 +51,7 @@ dependencies = [
 [[package]]
 name = "aya-ebpf-macros"
 version = "0.4.0"
-source = "git+https://github.com/mccormickt/aya?rev=e875aa8ffe65baa10b40f729776e0452de2e23c1#e875aa8ffe65baa10b40f729776e0452de2e23c1"
+source = "git+https://github.com/mccormickt/aya?rev=3fdc839683437f78972ebc0840708a94008c20db#3fdc839683437f78972ebc0840708a94008c20db"
 dependencies = [
  "proc-macro2",
  "quote",
