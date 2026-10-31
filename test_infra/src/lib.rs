@@ -195,6 +195,8 @@ pub enum Error {
     Spawn(#[source] io::Error),
     #[error("Waiting for timeout failed")]
     WaitTimeout(#[source] WaitTimeoutError),
+    #[error("Veth pair setup failed: {0}")]
+    VethSetup(String),
 }
 
 /// Polls a boolean condition until it becomes true or the timeout expires.
@@ -2432,6 +2434,63 @@ fn child_wait_timeout(child: &mut Child, timeout: u64) -> Result<(), WaitTimeout
     Ok(())
 }
 
+/// A veth pair created for AF_XDP throughput tests, torn down on drop.
+///
+/// `dev` is the interface Cloud Hypervisor binds AF_XDP sockets to (and loads
+/// the XDP redirect program onto); `peer` carries the host-side IP. They share
+/// an L2 segment, so host↔guest traffic flows host → `peer` → `dev` → XSK →
+/// guest. Requires root (the metrics harness already runs under sudo).
+pub struct VethPair {
+    dev: String,
+}
+
+impl VethPair {
+    /// Creates `dev`/`peer`, assigns `host_ip/25` to `peer`, and brings both up.
+    /// `num_queues` sets the per-end RX/TX queue count (use 1 for single queue).
+    pub fn new(dev: &str, peer: &str, host_ip: &str, num_queues: u32) -> Result<Self, Error> {
+        let queues = num_queues.max(1);
+        let create = format!(
+            "ip link add {dev} numrxqueues {queues} numtxqueues {queues} type veth \
+             peer name {peer} numrxqueues {queues} numtxqueues {queues}"
+        );
+        if !exec_host_command_status(&create).success() {
+            return Err(Error::VethSetup(create));
+        }
+        let setup = [
+            format!("ip addr add {host_ip}/25 dev {peer}"),
+            format!("ip link set {dev} up"),
+            format!("ip link set {peer} up"),
+        ];
+        for cmd in setup {
+            if !exec_host_command_status(&cmd).success() {
+                let _ = exec_host_command_status(&format!("ip link del {dev}"));
+                return Err(Error::VethSetup(cmd));
+            }
+        }
+
+        // Disable offloads on both ends. AF_XDP delivers raw L2 frames: with TX
+        // checksum offload the host leaves L4 checksums incomplete
+        // (CHECKSUM_PARTIAL) and the guest drops the frames, while GSO/TSO/GRO
+        // would produce frames larger than a UMEM chunk. Best-effort.
+        for end in [dev, peer] {
+            let _ = exec_host_command_status(&format!(
+                "ethtool -K {end} tx off rx off gso off tso off gro off 2>/dev/null || true"
+            ));
+        }
+
+        Ok(Self {
+            dev: dev.to_string(),
+        })
+    }
+}
+
+impl Drop for VethPair {
+    fn drop(&mut self) {
+        // Deleting one end removes the whole pair. Best-effort and quiet.
+        let _ = exec_host_command_status(&format!("ip link del {} 2>/dev/null || true", self.dev));
+    }
+}
+
 pub fn measure_virtio_net_throughput(
     test_timeout: u32,
     queue_pairs: u16,
@@ -2794,6 +2853,22 @@ pub use aarch64::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(devcli_testenv)]
+    #[test]
+    fn veth_setup_preserves_existing_interfaces() {
+        let _pair = VethPair::new("ch-veth0", "ch-veth1", "192.0.2.1", 1).unwrap();
+        let index = |name| {
+            let output = exec_host_command_output(&format!("ip -j link show dev {name}"));
+            assert!(output.status.success());
+            let links: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            links[0]["ifindex"].as_u64().unwrap()
+        };
+        let before = [index("ch-veth0"), index("ch-veth1")];
+        assert!(VethPair::new("ch-veth0", "ch-veth2", "192.0.2.2", 1).is_err());
+        assert_eq!([index("ch-veth0"), index("ch-veth1")], before);
+        assert!(!exec_host_command_status("ip link show dev ch-veth2").success());
+    }
 
     fn is_alive(pid: u32) -> bool {
         unsafe { libc::kill(pid as i32, 0) == 0 }
