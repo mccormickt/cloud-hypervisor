@@ -13,6 +13,8 @@ mod open_tap;
 mod queue_pair;
 mod tap;
 #[cfg(feature = "net_backend_af_xdp")]
+mod xdp_queue_pair;
+#[cfg(feature = "net_backend_af_xdp")]
 mod xsk;
 
 use std::io::Error as IoError;
@@ -40,6 +42,8 @@ pub use mac::{MAC_ADDR_LEN, MacAddr};
 pub use open_tap::{Error as OpenTapError, open_tap};
 pub use queue_pair::{NetCounters, NetQueuePair, NetQueuePairError, RxVirtio, TxVirtio};
 pub use tap::{Error as TapError, Tap, associate_taps};
+#[cfg(feature = "net_backend_af_xdp")]
+pub use xdp_queue_pair::{XdpQueuePair, XdpQueuePairError};
 #[cfg(feature = "net_backend_af_xdp")]
 pub use xsk::{XdpError, XdpSocketConfig, Xsk, iface_index, iface_mtu};
 
