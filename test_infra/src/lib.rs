@@ -1331,6 +1331,18 @@ impl Guest {
         )
     }
 
+    /// Net string for the in-process AF_XDP backend bound to `iface`, with the
+    /// `veth` `peer` carrying the host IP (see [`VethPair`]). No `ip=`/`mask=` is
+    /// passed (the host IP lives on the peer). `xdp_peer` makes CH attach a
+    /// pass-through program to the peer, which AF_XDP redirect on `veth`
+    /// requires (XDP on both ends); native attach mode is used.
+    pub fn default_net_string_xdp(&self, iface: &str, peer: &str) -> String {
+        format!(
+            "backend=xdp,xdp_iface={},xdp_peer={},mac={}",
+            iface, peer, self.network.guest_mac0
+        )
+    }
+
     pub fn default_net_string_w_mtu(&self, mtu: u16) -> String {
         format!(
             "tap=,mac={},ip={},mask=255.255.255.128,mtu={}",

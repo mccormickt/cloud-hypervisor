@@ -4,6 +4,9 @@ edition.workspace = true
 name = "performance-metrics"
 version = "0.1.0"
 
+[features]
+net_backend_af_xdp = []
+
 [dependencies]
 block = { path = "../block", features = ["io_uring", "test-utils"] }
 clap = { workspace = true, features = ["wrap_help"] }
