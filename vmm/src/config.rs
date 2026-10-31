@@ -293,6 +293,27 @@ pub enum ValidationError {
     /// Hardware checksum offload is disabled.
     #[error("\"offload_tso\" and \"offload_ufo\" depend on \"offload_csum\"")]
     NoHardwareChecksumOffload,
+    /// AF_XDP backend requested but the feature was not compiled in.
+    #[error(
+        "AF_XDP network backend requested but cloud-hypervisor was built without the \"net_backend_af_xdp\" feature"
+    )]
+    XdpFeatureDisabled,
+    /// AF_XDP backend requires the host interface name.
+    #[error("AF_XDP network backend requires \"xdp_iface\"")]
+    XdpMissingIface,
+    /// AF_XDP backend cannot be combined with TAP/fd/vhost-user selectors.
+    #[error("AF_XDP network backend cannot be combined with \"tap\", \"fd\", or \"vhost_user\"")]
+    XdpConflictingBackend,
+    /// AF_XDP backend does not support a virtual IOMMU.
+    #[error("AF_XDP network backend does not support being placed behind an IOMMU")]
+    XdpIommuNotSupported,
+    #[error("AF_XDP requires exactly one queue pair (num_queues=2)")]
+    XdpMultiqueueNotSupported,
+    #[error("xdp_* options require the AF_XDP backend")]
+    XdpOptionsWithoutBackend,
+    /// Requested MTU exceeds the AF_XDP single-frame budget.
+    #[error("AF_XDP MTU {0} exceeds the maximum {1} imposed by the aligned-chunk UMEM frame size")]
+    XdpMtuTooLarge(u16 /* requested */, u16 /* maximum */),
     /// Hugepages not turned on
     #[error("Huge page size specified but huge pages not enabled")]
     HugePageSizeWithoutHugePages,
@@ -1902,12 +1923,32 @@ impl FromStr for IommuType {
     }
 }
 
+#[derive(Debug)]
+pub enum ParseNetBackendError {
+    InvalidValue(String),
+}
+
+impl FromStr for NetBackend {
+    type Err = ParseNetBackendError;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "tap" => Ok(NetBackend::Tap),
+            "vhost_user" | "vhost-user" => Ok(NetBackend::VhostUser),
+            "xdp" | "af_xdp" | "af-xdp" => Ok(NetBackend::AfXdp),
+            _ => Err(ParseNetBackendError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
 impl NetConfig {
     pub const SYNTAX: &'static str = "Network parameters \
     \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,host_mac=<host_mac_addr>,\
     fd=<[fd1,fd2,...]>,iommu=off|virtio,mtu=<mtu>,num_queues=<number_of_queues>,\
     queue_size=<size_of_each_queue>,id=<device_id>,\
+    backend=tap|vhost_user|xdp,\
     vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
+    xdp_iface=<host_if_name>,xdp_peer=<veth_peer_name>,xdp_skb=on|off,xdp_zerocopy=on|off,\
     bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
     ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
@@ -1928,9 +1969,14 @@ impl NetConfig {
             .add("mtu")
             .add("queue_size")
             .add("num_queues")
+            .add("backend")
             .add("vhost_user")
             .add("socket")
             .add("vhost_mode")
+            .add("xdp_iface")
+            .add("xdp_peer")
+            .add("xdp_skb")
+            .add("xdp_zerocopy")
             .add("fd")
             .add("bw_size")
             .add("bw_one_time_burst")
@@ -1979,6 +2025,22 @@ impl NetConfig {
         let vhost_socket = parser.get("socket");
         let vhost_mode = parser
             .convert("vhost_mode")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or_default();
+        let xdp_iface = parser.get("xdp_iface");
+        let xdp_peer = parser.get("xdp_peer");
+        let xdp_skb = parser
+            .convert::<Toggle>("xdp_skb")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let xdp_zerocopy = parser
+            .convert::<Toggle>("xdp_zerocopy")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let backend = parser
+            .convert::<NetBackend>("backend")
             .map_err(Error::ParseNetwork)?
             .unwrap_or_default();
         let fds = parser
@@ -2040,6 +2102,7 @@ impl NetConfig {
 
         let config = NetConfig {
             pci_common,
+            backend,
             tap,
             ip,
             mask,
@@ -2056,8 +2119,16 @@ impl NetConfig {
             offload_tso,
             offload_ufo,
             offload_csum,
+            xdp_iface,
+            xdp_peer,
+            xdp_skb,
+            xdp_zerocopy,
         };
         Ok(config)
+    }
+
+    pub(crate) fn is_vhost_user(&self) -> bool {
+        self.vhost_user || self.backend == NetBackend::VhostUser
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
@@ -2096,11 +2167,11 @@ impl NetConfig {
 
         validate_queue_size(self.queue_size)?;
 
-        if self.vhost_user && self.pci_common.iommu.attached() {
+        if self.is_vhost_user() && self.pci_common.iommu.attached() {
             return Err(ValidationError::IommuNotSupported);
         }
 
-        if self.vhost_user && self.rate_limiter_config.is_some() {
+        if self.is_vhost_user() && self.rate_limiter_config.is_some() {
             return Err(ValidationError::VhostUserRateLimiterNotSupported);
         }
 
@@ -2120,6 +2191,37 @@ impl NetConfig {
 
         if self.ip.is_some() && self.mask.is_none() {
             return Err(ValidationError::IpProvidedWithoutMask);
+        }
+
+        if self.backend == NetBackend::AfXdp {
+            // `cfg!` keeps every check compiled (and lint-clean) regardless of
+            // the feature, while still failing fast when the datapath is absent.
+            if !cfg!(feature = "net_backend_af_xdp") {
+                return Err(ValidationError::XdpFeatureDisabled);
+            }
+            if self.tap.is_some() || self.fds.is_some() || self.vhost_user {
+                return Err(ValidationError::XdpConflictingBackend);
+            }
+            if self.pci_common.iommu.attached() {
+                return Err(ValidationError::XdpIommuNotSupported);
+            }
+            if self.xdp_iface.is_none() {
+                return Err(ValidationError::XdpMissingIface);
+            }
+            if self.num_queues != 2 {
+                return Err(ValidationError::XdpMultiqueueNotSupported);
+            }
+            if let Some(mtu) = self.mtu
+                && mtu > net_util::XDP_MAX_MTU
+            {
+                return Err(ValidationError::XdpMtuTooLarge(mtu, net_util::XDP_MAX_MTU));
+            }
+        } else if self.xdp_iface.is_some()
+            || self.xdp_peer.is_some()
+            || self.xdp_skb
+            || self.xdp_zerocopy
+        {
+            return Err(ValidationError::XdpOptionsWithoutBackend);
         }
 
         Ok(())
@@ -3473,6 +3575,12 @@ impl IvshmemConfig {
 }
 
 impl VmConfig {
+    pub(crate) fn has_af_xdp_net(&self) -> bool {
+        self.net
+            .as_ref()
+            .is_some_and(|nets| nets.iter().any(|net| net.backend == NetBackend::AfXdp))
+    }
+
     fn validate_identifier(
         id_list: &mut BTreeSet<String>,
         id: &Option<String>,
@@ -3771,13 +3879,13 @@ impl VmConfig {
 
         if let Some(nets) = &self.net {
             for net in nets {
-                if net.vhost_user && !self.backed_by_shared_memory() {
+                if net.is_vhost_user() && !self.backed_by_shared_memory() {
                     return Err(ValidationError::VhostUserRequiresSharedMemory);
                 }
-                if net.vhost_user && net.vhost_socket.is_none() {
+                if net.is_vhost_user() && net.vhost_socket.is_none() {
                     return Err(ValidationError::VhostUserMissingSocket);
                 }
-                if net.vhost_user && net.rate_limiter_config.is_some() {
+                if net.is_vhost_user() && net.rate_limiter_config.is_some() {
                     return Err(ValidationError::VhostUserRateLimiterNotSupported);
                 }
                 net.validate(self)?;
@@ -5081,6 +5189,7 @@ mod tests {
     fn net_fixture() -> NetConfig {
         NetConfig {
             pci_common: PciDeviceCommonConfig::default(),
+            backend: NetBackend::Tap,
             tap: None,
             ip: None,
             mask: None,
@@ -5097,6 +5206,10 @@ mod tests {
             offload_tso: false,
             offload_ufo: false,
             offload_csum: false,
+            xdp_iface: None,
+            xdp_peer: None,
+            xdp_skb: false,
+            xdp_zerocopy: false,
         }
     }
 
@@ -5137,6 +5250,33 @@ mod tests {
             NetConfig {
                 vhost_user: true,
                 vhost_socket: Some("/tmp/sock".to_owned()),
+                ..net_fixture()
+            }
+        );
+
+        // `backend=vhost_user` is equivalent to the legacy `vhost_user=on`.
+        assert_eq!(
+            NetConfig::parse(
+                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,backend=vhost_user,socket=/tmp/sock"
+            )?,
+            NetConfig {
+                backend: NetBackend::VhostUser,
+                vhost_socket: Some("/tmp/sock".to_owned()),
+                ..net_fixture()
+            }
+        );
+
+        // AF_XDP backend selection and its keys.
+        assert_eq!(
+            NetConfig::parse(
+                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,backend=xdp,xdp_iface=eth0,xdp_peer=veth1,xdp_skb=on,xdp_zerocopy=on"
+            )?,
+            NetConfig {
+                backend: NetBackend::AfXdp,
+                xdp_iface: Some("eth0".to_owned()),
+                xdp_peer: Some("veth1".to_owned()),
+                xdp_skb: true,
+                xdp_zerocopy: true,
                 ..net_fixture()
             }
         );
@@ -8111,7 +8251,130 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config.validate(),
             Err(ValidationError::IdentifierNotUnique("test0".to_string()))
         );
+
+        // --- AF_XDP backend validation ---
+        let xdp_net = NetConfig {
+            backend: NetBackend::AfXdp,
+            host_mac: None,
+            xdp_iface: Some("eth0".to_string()),
+            ..net_fixture()
+        };
+
+        // Without the feature, the backend is refused outright.
+        #[cfg(not(feature = "net_backend_af_xdp"))]
+        {
+            let mut invalid_config = valid_config.clone();
+            invalid_config.net = Some(vec![xdp_net.clone()]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::XdpFeatureDisabled)
+            );
+        }
+
+        #[cfg(feature = "net_backend_af_xdp")]
+        {
+            let mut ok_config = valid_config.clone();
+            ok_config.net = Some(vec![xdp_net.clone()]);
+            ok_config.validate().unwrap();
+
+            let mut invalid_config = valid_config.clone();
+            invalid_config.net = Some(vec![NetConfig {
+                xdp_iface: None,
+                ..xdp_net.clone()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::XdpMissingIface)
+            );
+
+            let mut invalid_config = valid_config.clone();
+            invalid_config.net = Some(vec![NetConfig {
+                tap: Some("tap0".to_string()),
+                ..xdp_net.clone()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::XdpConflictingBackend)
+            );
+
+            let mut invalid_config = valid_config.clone();
+            invalid_config.net = Some(vec![NetConfig {
+                mtu: Some(9000),
+                ..xdp_net.clone()
+            }]);
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::XdpMtuTooLarge(9000, net_util::XDP_MAX_MTU))
+            );
+
+            for (mtu, valid) in [(3826, true), (3827, false)] {
+                let mut config = valid_config.clone();
+                config.net = Some(vec![NetConfig {
+                    mtu: Some(mtu),
+                    ..xdp_net.clone()
+                }]);
+                assert_eq!(config.validate().is_ok(), valid);
+            }
+            for (num_queues, expected) in [
+                (3, ValidationError::VnetQueueOdd(3)),
+                (4, ValidationError::XdpMultiqueueNotSupported),
+            ] {
+                let mut config = valid_config.clone();
+                config.cpus.boot_vcpus = 2;
+                config.cpus.max_vcpus = 2;
+                config.net = Some(vec![NetConfig {
+                    num_queues,
+                    ..xdp_net.clone()
+                }]);
+                assert_eq!(config.validate(), Err(expected));
+            }
+        }
     }
+
+    #[test]
+    fn net_backend_cli_json_parity() {
+        for (cli, json, vhost_user) in [
+            ("", r#"{}"#, false),
+            ("vhost_user=on", r#"{"vhost_user":true}"#, true),
+            ("backend=vhost_user", r#"{"backend":"vhost_user"}"#, true),
+            (
+                "backend=vhost_user,vhost_user=off",
+                r#"{"backend":"vhost_user","vhost_user":false}"#,
+                true,
+            ),
+            (
+                "backend=tap,vhost_user=on",
+                r#"{"backend":"tap","vhost_user":true}"#,
+                true,
+            ),
+        ] {
+            let cli = NetConfig::parse(cli).unwrap();
+            let json: NetConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(cli, json);
+            assert_eq!(cli.is_vhost_user(), vhost_user);
+        }
+    }
+
+    #[test]
+    fn json_vhost_backend_uses_vhost_validation() {
+        let net: NetConfig = serde_json::from_str(r#"{"backend":"vhost_user"}"#).unwrap();
+        assert!(!net.vhost_user);
+        assert!(net.is_vhost_user());
+        let mut config: VmConfig =
+            serde_json::from_str(r#"{"payload":{"kernel":"kernel"}}"#).unwrap();
+        config.net = Some(vec![net]);
+        config.memory.shared = true;
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::VhostUserMissingSocket)
+        );
+        config.net = Some(vec![NetConfig::parse("xdp_iface=eth0").unwrap()]);
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::XdpOptionsWithoutBackend)
+        );
+    }
+
     #[test]
     fn test_landlock_parsing() -> Result<()> {
         // should not be empty

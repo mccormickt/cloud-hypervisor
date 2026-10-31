@@ -1309,6 +1309,11 @@ components:
     NetConfig:
       type: object
       properties:
+        backend:
+          type: string
+          enum: [tap, vhost_user, af_xdp]
+          default: tap
+          description: AF_XDP requires the net_backend_af_xdp build feature and is boot-only.
         tap:
           type: string
         ip:
@@ -1342,6 +1347,20 @@ components:
         vhost_mode:
           type: string
           default: "Client"
+        xdp_iface:
+          type: string
+          description: Dedicated host interface for AF_XDP queue 0. Required for af_xdp.
+        xdp_peer:
+          type: string
+          description: Optional veth peer for an FD-owned pass-through XDP program.
+        xdp_skb:
+          type: boolean
+          default: false
+          description: Require generic XDP mode with FD-owned link support.
+        xdp_zerocopy:
+          type: boolean
+          default: false
+          description: Require NIC zero-copy support. No copy fallback is used.
         id:
           type: string
         pci_segment:
