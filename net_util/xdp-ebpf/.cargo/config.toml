@@ -1,0 +1,12 @@
+# Lets a bare `cargo build`/`cargo check` run from this directory target the
+# eBPF backend without extra flags. `net_util`'s `build.rs` (via `aya-build`)
+# passes the same `--target` and `-Z build-std` explicitly, so this only matters
+# for working on the eBPF crate directly.
+#
+# NB: this file is loaded only when cargo is invoked from this directory; it is
+# ignored from the workspace root.
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]

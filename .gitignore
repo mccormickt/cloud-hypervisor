@@ -1,5 +1,6 @@
 **/*.rs.bk
 **/Cargo.lock
+!/net_util/xdp-ebpf/Cargo.lock
 **/rusty-tags.vi
 /.agents
 /.cargo
