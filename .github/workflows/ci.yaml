@@ -715,7 +715,7 @@ jobs:
     name: integration-x86-64-mq
     needs: [preflight]
     if: &mq-if >-
-      (github.event_name == 'merge_group' || github.event_name == 'push') && needs.preflight.outputs.full == 'true'
+      (github.event_name == 'merge_group' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/dev/'))) && needs.preflight.outputs.full == 'true'
     timeout-minutes: 80
     env:
       # Our runner has 16 cores (nproc).
