@@ -282,7 +282,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "aya"
 version = "0.16.0"
-source = "git+https://github.com/mccormickt/aya?rev=3fdc839683437f78972ebc0840708a94008c20db#3fdc839683437f78972ebc0840708a94008c20db"
+source = "git+https://github.com/mccormickt/aya?rev=f0471a9bec8d297d6962e8f604dbaf21d4036701#f0471a9bec8d297d6962e8f604dbaf21d4036701"
 dependencies = [
  "assert_matches",
  "aya-obj",
@@ -299,7 +299,7 @@ dependencies = [
 [[package]]
 name = "aya-build"
 version = "0.2.1"
-source = "git+https://github.com/mccormickt/aya?rev=3fdc839683437f78972ebc0840708a94008c20db#3fdc839683437f78972ebc0840708a94008c20db"
+source = "git+https://github.com/mccormickt/aya?rev=f0471a9bec8d297d6962e8f604dbaf21d4036701#f0471a9bec8d297d6962e8f604dbaf21d4036701"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -310,7 +310,7 @@ dependencies = [
 [[package]]
 name = "aya-obj"
 version = "0.6.0"
-source = "git+https://github.com/mccormickt/aya?rev=3fdc839683437f78972ebc0840708a94008c20db#3fdc839683437f78972ebc0840708a94008c20db"
+source = "git+https://github.com/mccormickt/aya?rev=f0471a9bec8d297d6962e8f604dbaf21d4036701#f0471a9bec8d297d6962e8f604dbaf21d4036701"
 dependencies = [
  "bytes",
  "log",

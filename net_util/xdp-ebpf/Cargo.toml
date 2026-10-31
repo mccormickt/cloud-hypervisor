@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 # Kernel-side eBPF support. Pinned to the same fork revision as `net_util`'s
 # `aya`/`aya-build` dependencies.
-aya-ebpf = { git = "https://github.com/mccormickt/aya", rev = "3fdc839683437f78972ebc0840708a94008c20db" }
+aya-ebpf = { git = "https://github.com/mccormickt/aya", rev = "f0471a9bec8d297d6962e8f604dbaf21d4036701" }
 
 # Standalone workspace so the inner cargo invocation does not try to join the
 # Cloud Hypervisor workspace (which excludes this crate).
