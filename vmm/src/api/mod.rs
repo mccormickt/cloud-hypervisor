@@ -79,6 +79,10 @@ pub enum ApiError {
     #[error("API request send error")]
     RequestSend(#[source] SendError<ApiRequest>),
 
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[error("Prepared boot request channel is closed")]
+    PreparedBootSend,
+
     /// Wrong response payload type
     #[error("Wrong response payload type")]
     ResponsePayloadType,
@@ -889,6 +893,10 @@ pub trait RequestHandler {
 
     fn vm_boot(&mut self) -> Result<(), VmError>;
 
+    #[cfg(feature = "net_backend_af_xdp")]
+    fn vm_boot_with_resources(&mut self, resources: crate::XdpBootResources)
+    -> Result<(), VmError>;
+
     fn vm_pause(&mut self) -> Result<(), VmError>;
 
     fn vm_resume(&mut self) -> Result<(), VmError>;
@@ -1020,7 +1028,7 @@ fn get_response_body<Action: ApiAction<ResponseBody = Option<Body>>>(
 }
 
 pub trait ApiAction: Send + Sync {
-    type RequestBody: Send + Sync + Sized;
+    type RequestBody: Send + Sized;
     type ResponseBody: Send + Sized;
 
     fn request(&self, body: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest;
@@ -1367,6 +1375,74 @@ impl ApiAction for VmAddUserDevice {
 }
 
 pub struct VmBoot;
+
+/// In-process boot with move-only packet endpoints. No HTTP/JSON equivalent.
+///
+/// `send` waits for the VMM result. A failed notification cancels ownership
+/// transfer if execution has not started; otherwise it waits for the result.
+/// `ResponseRecv` means the outcome is unknown, not that boot was rejected.
+/// Revoke steering, shut down/join the VMM, then wait on endpoint release
+/// fences before queue/IP reuse. Run these blocking operations off async
+/// executor workers. Keep privileged cleanup on a pre-existing OS thread.
+#[cfg(feature = "net_backend_af_xdp")]
+pub struct VmBootWithResources;
+
+#[cfg(feature = "net_backend_af_xdp")]
+impl ApiAction for VmBootWithResources {
+    type RequestBody = crate::XdpBootResources;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        resources: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            let response = vmm
+                .vm_boot_with_resources(resources)
+                .map_err(ApiError::VmBoot)
+                .map(|()| ApiResponsePayload::Empty);
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        resources: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        use std::sync::{Arc, Mutex};
+
+        let (response_sender, response_receiver) = channel();
+        let pending = Arc::new(Mutex::new(Some(resources)));
+        let queued = Arc::clone(&pending);
+        let request: ApiRequest = Box::new(move |vmm| {
+            let resources = queued.lock().unwrap().take();
+            match resources {
+                Some(resources) => VmBootWithResources.request(resources, response_sender)(vmm),
+                None => Ok(false),
+            }
+        });
+        if let Err(error) = api_sender.send(request) {
+            drop(error);
+            return Err(ApiError::PreparedBootSend);
+        }
+        if let Err(error) = api_evt.write(1)
+            && let Some(resources) = pending.lock().unwrap().take()
+        {
+            drop(resources);
+            return Err(ApiError::EventFdWrite(error));
+        }
+        match response_receiver.recv().map_err(ApiError::ResponseRecv)?? {
+            ApiResponsePayload::Empty => Ok(None),
+            _ => Err(ApiError::ResponsePayloadType),
+        }
+    }
+}
 
 impl ApiAction for VmBoot {
     type RequestBody = ();
@@ -2217,6 +2293,38 @@ mod tests {
     use std::{env, fs, process};
 
     use super::*;
+
+    #[cfg(all(devcli_testenv, feature = "net_backend_af_xdp"))]
+    #[test]
+    fn prepared_boot_cancels_owned_resources_on_transport_failure() {
+        use net_util::{PreparedXdpNet, XdpSocketConfig};
+
+        // xdp-test0 must have two queues and no other bound sockets.
+        for (queue, notify_failure) in [(0, false), (1, true)] {
+            let endpoint =
+                PreparedXdpNet::new("xdp-test0", queue, XdpSocketConfig::default()).unwrap();
+            let fence = endpoint.release_fence();
+            let resources = [("nic0".to_owned(), endpoint)].into_iter().collect();
+            let (sender, receiver) = channel();
+            let event = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            if notify_failure {
+                event.write(u64::MAX - 1).unwrap();
+                let result = VmBootWithResources.send(event, sender, resources);
+                assert!(matches!(result, Err(ApiError::EventFdWrite(_))));
+                // The cancelled request is still queued, but must not retain
+                // the endpoint or start a VM if it is later dispatched.
+                let queued = receiver.try_recv().unwrap();
+                assert!(fence.is_released());
+                drop(queued);
+            } else {
+                drop(receiver);
+                let result = VmBootWithResources.send(event, sender, resources);
+                assert!(matches!(result, Err(ApiError::PreparedBootSend)));
+                assert!(fence.is_released());
+            }
+            fence.wait();
+        }
+    }
 
     struct TestDir {
         path: PathBuf,

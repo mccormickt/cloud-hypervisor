@@ -309,6 +309,10 @@ pub enum ValidationError {
     XdpIommuNotSupported,
     #[error("AF_XDP requires exactly one queue pair (num_queues=2)")]
     XdpMultiqueueNotSupported,
+    #[error(
+        "Externally managed AF_XDP requires an explicit nonempty NIC id and no peer/skb options"
+    )]
+    XdpExternalConfig,
     #[error("xdp_* options require the AF_XDP backend")]
     XdpOptionsWithoutBackend,
     /// Requested MTU exceeds the AF_XDP single-frame budget.
@@ -1948,7 +1952,7 @@ impl NetConfig {
     queue_size=<size_of_each_queue>,id=<device_id>,\
     backend=tap|vhost_user|xdp,\
     vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
-    xdp_iface=<host_if_name>,xdp_peer=<veth_peer_name>,xdp_skb=on|off,xdp_zerocopy=on|off,\
+    xdp_iface=<host_if_name>,xdp_peer=<veth_peer_name>,xdp_skb=on|off,xdp_zerocopy=on|off,xdp_external=on|off,\
     bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
     ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
@@ -1977,6 +1981,7 @@ impl NetConfig {
             .add("xdp_peer")
             .add("xdp_skb")
             .add("xdp_zerocopy")
+            .add("xdp_external")
             .add("fd")
             .add("bw_size")
             .add("bw_one_time_burst")
@@ -2036,6 +2041,11 @@ impl NetConfig {
             .0;
         let xdp_zerocopy = parser
             .convert::<Toggle>("xdp_zerocopy")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let xdp_external = parser
+            .convert::<Toggle>("xdp_external")
             .map_err(Error::ParseNetwork)?
             .unwrap_or(Toggle(false))
             .0;
@@ -2123,6 +2133,7 @@ impl NetConfig {
             xdp_peer,
             xdp_skb,
             xdp_zerocopy,
+            xdp_external,
         };
         Ok(config)
     }
@@ -2208,6 +2219,13 @@ impl NetConfig {
             if self.xdp_iface.is_none() {
                 return Err(ValidationError::XdpMissingIface);
             }
+            if self.xdp_external
+                && (self.pci_common.id.as_ref().is_none_or(|id| id.is_empty())
+                    || self.xdp_peer.is_some()
+                    || self.xdp_skb)
+            {
+                return Err(ValidationError::XdpExternalConfig);
+            }
             if self.num_queues != 2 {
                 return Err(ValidationError::XdpMultiqueueNotSupported);
             }
@@ -2220,6 +2238,7 @@ impl NetConfig {
             || self.xdp_peer.is_some()
             || self.xdp_skb
             || self.xdp_zerocopy
+            || self.xdp_external
         {
             return Err(ValidationError::XdpOptionsWithoutBackend);
         }
@@ -5210,6 +5229,7 @@ mod tests {
             xdp_peer: None,
             xdp_skb: false,
             xdp_zerocopy: false,
+            xdp_external: false,
         }
     }
 
@@ -8353,6 +8373,46 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             assert_eq!(cli, json);
             assert_eq!(cli.is_vhost_user(), vhost_user);
         }
+    }
+
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[test]
+    fn external_xdp_config_requires_stable_identity_and_external_steering() {
+        let net =
+            NetConfig::parse("backend=xdp,xdp_iface=cell0,xdp_external=on,id=cell/nic:7").unwrap();
+        let json: NetConfig = serde_json::from_str(
+            r#"{"backend":"af_xdp","xdp_iface":"cell0","xdp_external":true,"id":"cell/nic:7"}"#,
+        )
+        .unwrap();
+        assert_eq!(net, json);
+        let mut config: VmConfig =
+            serde_json::from_str(r#"{"payload":{"kernel":"kernel"}}"#).unwrap();
+        config.net = Some(vec![net.clone()]);
+        config.validate().unwrap();
+        for options in ["id=", "xdp_peer=peer0,id=nic0", "xdp_skb=on,id=nic0"] {
+            config.net = Some(vec![
+                NetConfig::parse(&format!(
+                    "backend=xdp,xdp_iface=cell0,xdp_external=on,{options}",
+                ))
+                .unwrap(),
+            ]);
+            assert_eq!(config.validate(), Err(ValidationError::XdpExternalConfig));
+        }
+        config.net = Some(vec![NetConfig {
+            pci_common: PciDeviceCommonConfig::default(),
+            ..net.clone()
+        }]);
+        assert_eq!(config.validate(), Err(ValidationError::XdpExternalConfig));
+        config.net = Some(vec![net.clone(), net]);
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::IdentifierNotUnique(_))
+        ));
+        config.net = Some(vec![NetConfig::parse("xdp_external=on").unwrap()]);
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::XdpOptionsWithoutBackend)
+        );
     }
 
     #[test]

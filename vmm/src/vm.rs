@@ -81,8 +81,6 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-#[cfg(feature = "net_backend_af_xdp")]
-use crate::cap;
 use crate::config::{MemoryRestoreMode, ValidationError, add_to_config};
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -115,6 +113,8 @@ use crate::{
     CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemoryMmap,
     MEMORY_MANAGER_SNAPSHOT_ID, MemoryZoneUpdateError, PciDeviceInfo, acpi, cpu,
 };
+#[cfg(feature = "net_backend_af_xdp")]
+use crate::{cap, xdp};
 
 /// Errors associated with VM management
 #[derive(Debug, Error)]
@@ -158,6 +158,10 @@ pub enum Error {
     #[cfg(feature = "net_backend_af_xdp")]
     #[error("AF_XDP setup is unavailable")]
     AfXdpSetup(#[source] io::Error),
+
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[error("AF_XDP prepared resources do not match NIC {0:?}")]
+    AfXdpResource(String),
 
     #[error("AF_XDP VM reboot requires a fresh VMM process")]
     AfXdpRebootUnsupported,
@@ -563,6 +567,7 @@ impl Vm {
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
+        #[cfg(feature = "net_backend_af_xdp")] resources: crate::XdpBootResources,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
 
@@ -581,8 +586,17 @@ impl Vm {
         }
 
         #[cfg(feature = "net_backend_af_xdp")]
-        if config.lock().unwrap().has_af_xdp_net() {
-            cap::check_xdp_setup().map_err(Error::AfXdpSetup)?;
+        {
+            let mut config = config.lock().unwrap();
+            xdp::validate(&mut config, &resources)?;
+            if config
+                .net
+                .iter()
+                .flatten()
+                .any(|net| net.backend == NetBackend::AfXdp && !net.xdp_external)
+            {
+                cap::check_xdp_setup().map_err(Error::AfXdpSetup)?;
+            }
         }
 
         info!("Booting VM from config: {config:?}");
@@ -641,6 +655,8 @@ impl Vm {
             #[cfg(not(target_arch = "riscv64"))]
             timestamp,
             snapshot,
+            #[cfg(feature = "net_backend_af_xdp")]
+            resources,
         )?;
 
         // Perform hypervisor-specific initialization
@@ -813,6 +829,7 @@ impl Vm {
         boot_id_list: BTreeSet<String>,
         #[cfg(not(target_arch = "riscv64"))] timestamp: Instant,
         snapshot: Option<&Snapshot>,
+        #[cfg(feature = "net_backend_af_xdp")] resources: crate::XdpBootResources,
     ) -> Result<Arc<Mutex<DeviceManager>>> {
         let dynamic = true;
 
@@ -835,6 +852,8 @@ impl Vm {
             timestamp,
             snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID),
             dynamic,
+            #[cfg(feature = "net_backend_af_xdp")]
+            resources,
         )
         .map_err(Error::DeviceManager)
     }
@@ -1311,6 +1330,7 @@ impl Vm {
         source_url: Option<&str>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
+        #[cfg(feature = "net_backend_af_xdp")] resources: crate::XdpBootResources,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1411,6 +1431,8 @@ impl Vm {
             snapshot,
             #[cfg(feature = "igvm")]
             igvm_file,
+            #[cfg(feature = "net_backend_af_xdp")]
+            resources,
         )
     }
 

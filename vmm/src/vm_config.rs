@@ -592,6 +592,10 @@ pub struct NetConfig {
     /// fail at bind time; guest data is still copied into UMEM.
     #[serde(default)]
     pub xdp_zerocopy: bool,
+    /// Require a move-only endpoint supplied by the in-process boot API.
+    /// The runtime owns program attachment and map registration.
+    #[serde(default)]
+    pub xdp_external: bool,
 }
 
 pub fn default_netconfig_tap() -> Option<String> {

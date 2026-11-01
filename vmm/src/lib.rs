@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "guest_debug")]
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, RecvError, SendError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvError, SendError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use std::{any, io, mem, panic, path, process, result, thread};
@@ -113,6 +113,10 @@ mod uffd;
 mod userfaultfd;
 pub mod vm;
 pub mod vm_config;
+#[cfg(feature = "net_backend_af_xdp")]
+mod xdp;
+#[cfg(feature = "net_backend_af_xdp")]
+pub use xdp::XdpBootResources;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
@@ -139,6 +143,10 @@ pub enum Error {
     /// Cannot read from EventFd.
     #[error("Error reading from EventFd")]
     EventFdRead(#[source] io::Error),
+
+    /// Cannot write to EventFd.
+    #[error("Error writing to EventFd")]
+    EventFdWrite(#[source] io::Error),
 
     /// Cannot create epoll context.
     #[error("Error creating epoll context")]
@@ -816,6 +824,74 @@ impl ReceiveMigrationState {
 impl Vmm {
     pub const HANDLED_SIGNALS: [i32; 2] = [SIGTERM, SIGINT];
 
+    fn boot_vm(
+        &mut self,
+        #[cfg(feature = "net_backend_af_xdp")] resources: XdpBootResources,
+    ) -> result::Result<(), VmError> {
+        match &self.vm {
+            VmOwnership::Owned(_) => return Err(VmError::VmAlreadyCreated),
+            VmOwnership::Migration { .. } => return Err(VmError::VmMigrating),
+            VmOwnership::None => {}
+        }
+        tracer::start();
+        info!("Booting VM");
+        event!("vm", "booting");
+        let result = (|| {
+            trace_scoped!("vm_boot");
+            let vm_config = self.vm_config.clone().ok_or(VmError::VmMissingConfig)?;
+            #[cfg(feature = "net_backend_af_xdp")]
+            xdp::validate(&mut vm_config.lock().unwrap(), &resources)?;
+            if self.console_info.is_none() {
+                self.console_info =
+                    Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
+            }
+            let mut vm = Vm::new(
+                vm_config,
+                self.exit_evt.try_clone().map_err(VmError::EventFdClone)?,
+                self.reset_evt.try_clone().map_err(VmError::EventFdClone)?,
+                self.guest_exit_evt
+                    .try_clone()
+                    .map_err(VmError::EventFdClone)?,
+                #[cfg(feature = "guest_debug")]
+                self.vm_debug_evt
+                    .try_clone()
+                    .map_err(VmError::EventFdClone)?,
+                &self.seccomp_action,
+                Arc::clone(&self.hypervisor),
+                self.activate_evt
+                    .try_clone()
+                    .map_err(VmError::EventFdClone)?,
+                self.console_info.clone(),
+                self.console_resize_pipe.clone(),
+                Arc::clone(&self.original_termios_opt),
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "net_backend_af_xdp")]
+                resources,
+            )?;
+            let result = vm.boot();
+            #[cfg(feature = "net_backend_af_xdp")]
+            if result.is_err() && vm.get_config().lock().unwrap().has_af_xdp_net() {
+                // Stop vCPUs before dropping the packet devices and their workers.
+                if let Err(error) = vm.shutdown() {
+                    warn!("Failed to shut down rejected AF_XDP boot: {error}");
+                }
+                drop(vm);
+                self.console_info = None;
+                return result;
+            }
+            self.vm = VmOwnership::Owned(vm);
+            result
+        })();
+        tracer::end();
+        if result.is_ok() {
+            event!("vm", "booted");
+        }
+        result
+    }
+
     fn signal_handler(
         mut signals: Signals,
         original_termios_opt: &Mutex<Option<termios>>,
@@ -1486,6 +1562,8 @@ impl Vmm {
                 Some(&snapshot),
                 #[cfg(feature = "igvm")]
                 None,
+                #[cfg(feature = "net_backend_af_xdp")]
+                XdpBootResources::default(),
             )
             .map_err(|e| {
                 MigratableError::MigrateReceive(anyhow!("Error creating VM from snapshot: {e:?}"))
@@ -2123,6 +2201,8 @@ impl Vmm {
                     Some(source_url),
                     Some(prefault),
                     Some(memory_restore_mode),
+                    #[cfg(feature = "net_backend_af_xdp")]
+                    XdpBootResources::default(),
                 )?;
 
                 if self
@@ -2349,14 +2429,28 @@ impl Vmm {
                         }
                     }
                     EpollDispatch::Api => {
-                        // Consume the events.
-                        for _ in 0..self.api_evt.read().map_err(Error::EventFdRead)? {
-                            // Read from the API receiver channel
-                            let api_request = api_receiver.recv().map_err(Error::ApiRequestRecv)?;
-
+                        // Notifications wake the dispatcher; cancelled requests
+                        // need not have a matching eventfd count.
+                        self.api_evt.read().map_err(Error::EventFdRead)?;
+                        const MAX_REQUESTS: usize = 64;
+                        let mut processed = 0;
+                        while processed < MAX_REQUESTS {
+                            let api_request = match api_receiver.try_recv() {
+                                Ok(request) => request,
+                                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                            };
                             if api_request(self)? {
                                 break 'outer;
                             }
+                            processed += 1;
+                        }
+                        // Give other event sources a turn, and retain a wake-up
+                        // for any remaining requests. EAGAIN is already readable.
+                        if processed == MAX_REQUESTS
+                            && let Err(error) = self.api_evt.write(1)
+                            && error.kind() != io::ErrorKind::WouldBlock
+                        {
+                            return Err(Error::EventFdWrite(error));
                         }
                     }
                     #[cfg(feature = "guest_debug")]
@@ -2527,81 +2621,18 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_boot(&mut self) -> result::Result<(), VmError> {
-        match &self.vm {
-            VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
-            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
-            VmOwnership::None => {
-                tracer::start();
-                info!("Booting VM");
-                event!("vm", "booting");
+        self.boot_vm(
+            #[cfg(feature = "net_backend_af_xdp")]
+            XdpBootResources::default(),
+        )
+    }
 
-                let r = (|| {
-                    trace_scoped!("vm_boot");
-                    // If we don't have a config, we cannot boot a VM.
-                    if self.vm_config.is_none() {
-                        return Err(VmError::VmMissingConfig);
-                    }
-
-                    // console_info is set to None in vm_shutdown. re-populate here if empty
-                    if self.console_info.is_none() {
-                        self.console_info = Some(
-                            pre_create_console_devices(self)
-                                .map_err(VmError::CreateConsoleDevices)?,
-                        );
-                    }
-
-                    // Create a new VM if we don't have one yet.
-                    let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
-                    let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
-                    let guest_exit_evt = self
-                        .guest_exit_evt
-                        .try_clone()
-                        .map_err(VmError::EventFdClone)?;
-                    #[cfg(feature = "guest_debug")]
-                    let vm_debug_evt = self
-                        .vm_debug_evt
-                        .try_clone()
-                        .map_err(VmError::EventFdClone)?;
-                    let activate_evt = self
-                        .activate_evt
-                        .try_clone()
-                        .map_err(VmError::EventFdClone)?;
-
-                    if let Some(ref vm_config) = self.vm_config {
-                        let mut vm = Vm::new(
-                            Arc::clone(vm_config),
-                            exit_evt,
-                            reset_evt,
-                            guest_exit_evt,
-                            #[cfg(feature = "guest_debug")]
-                            vm_debug_evt,
-                            &self.seccomp_action,
-                            Arc::clone(&self.hypervisor),
-                            activate_evt,
-                            self.console_info.clone(),
-                            self.console_resize_pipe.clone(),
-                            Arc::clone(&self.original_termios_opt),
-                            None,
-                            None,
-                            None,
-                            None,
-                        )?;
-
-                        let r = vm.boot();
-                        self.vm = VmOwnership::Owned(vm);
-                        r
-                    } else {
-                        Err(VmError::VmNotCreated)
-                    }
-                })();
-
-                tracer::end();
-                if r.is_ok() {
-                    event!("vm", "booted");
-                }
-                r
-            }
-        }
+    #[cfg(feature = "net_backend_af_xdp")]
+    fn vm_boot_with_resources(
+        &mut self,
+        resources: XdpBootResources,
+    ) -> result::Result<(), VmError> {
+        self.boot_vm(resources)
     }
 
     fn vm_pause(&mut self) -> result::Result<(), VmError> {
@@ -2837,6 +2868,8 @@ impl RequestHandler for Vmm {
             None,
             None,
             None,
+            #[cfg(feature = "net_backend_af_xdp")]
+            XdpBootResources::default(),
         )?;
 
         // And we boot it
@@ -3768,6 +3801,176 @@ mod tests {
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
         })
+    }
+
+    #[cfg(all(devcli_testenv, feature = "net_backend_af_xdp"))]
+    #[test]
+    fn test_prepared_xdp_boot_failure_and_fresh_generation() {
+        use net_util::{PreparedXdpNet, XdpSocketConfig};
+
+        use crate::vm_config::NetConfig;
+
+        // Prepare on a privileged thread before the VMM restricts this thread.
+        // The fixture needs two queues; each boot consumes a different endpoint.
+        let endpoints: Vec<_> = (0..2)
+            .map(|queue| {
+                PreparedXdpNet::new("xdp-test0", queue, XdpSocketConfig::default()).unwrap()
+            })
+            .collect();
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.net = Some(vec![
+            NetConfig::parse("backend=xdp,xdp_iface=xdp-test0,xdp_external=on,id=nic0").unwrap(),
+        ]);
+        vmm.vm_create(config).unwrap();
+        assert!(matches!(vmm.vm_boot(), Err(VmError::AfXdpResource(id)) if id == "nic0"));
+        for endpoint in endpoints {
+            let fence = endpoint.release_fence();
+            let resources = [("nic0".to_owned(), endpoint)].into_iter().collect();
+            assert!(matches!(
+                vmm.vm_boot_with_resources(resources),
+                Err(VmError::KernelFile(_))
+            ));
+            assert!(
+                fence.is_released(),
+                "failed boot must release the consumed endpoint"
+            );
+            fence.wait();
+            assert_eq!(vmm.vm_info().unwrap().state, VmState::Created);
+        }
+        assert!(matches!(vmm.vm_boot(), Err(VmError::AfXdpResource(id)) if id == "nic0"));
+        vmm.vm_delete().unwrap();
+    }
+
+    #[cfg(all(devcli_testenv, feature = "net_backend_af_xdp"))]
+    #[test]
+    fn test_prepared_xdp_constructor_failure_preserves_config() {
+        use net_util::{PreparedXdpNet, XdpSocketConfig};
+        use virtio_devices::net;
+
+        use crate::device_manager::DeviceManagerError;
+        use crate::vm_config::NetConfig;
+
+        let endpoints: Vec<_> = (0..2)
+            .map(|queue| {
+                PreparedXdpNet::new("xdp-test0", queue, XdpSocketConfig::default()).unwrap()
+            })
+            .collect();
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.net = Some(vec![
+            NetConfig::parse("backend=xdp,xdp_iface=xdp-test0,xdp_external=on,id=nic0").unwrap(),
+            NetConfig::parse("backend=xdp,xdp_iface=xdp-missing,id=nic1").unwrap(),
+        ]);
+        let expected = config.net.clone();
+        vmm.vm_create(config).unwrap();
+        for endpoint in endpoints {
+            let fence = endpoint.release_fence();
+            let resources = [("nic0".to_owned(), endpoint)].into_iter().collect();
+            assert!(matches!(
+                vmm.vm_boot_with_resources(resources),
+                Err(VmError::DeviceManager(DeviceManagerError::CreateVirtioNet(
+                    net::Error::Xdp(_)
+                )))
+            ));
+            assert!(fence.is_released());
+            assert_eq!(vmm.vm_info().unwrap().config.net, expected);
+            assert!(matches!(vmm.vm_boot(), Err(VmError::AfXdpResource(id)) if id == "nic0"));
+            assert!(matches!(
+                vmm.vm_boot_with_resources(XdpBootResources::new()),
+                Err(VmError::AfXdpResource(id)) if id == "nic0"
+            ));
+        }
+        vmm.vm_delete().unwrap();
+    }
+
+    #[cfg(all(devcli_testenv, feature = "net_backend_af_xdp"))]
+    #[test]
+    fn test_prepared_boot_notification_cancellation_allows_dispatch() {
+        use crate::api::{ApiAction, ApiError, ApiResponsePayload, VmBootWithResources, VmInfo};
+
+        // Including the cancelled request, cover a short queue, exactly one
+        // dispatch budget, and a backlog that needs multiple wake-ups.
+        for count in [1, 63, 130] {
+            let mut vmm = create_dummy_vmm();
+            vmm.vm_create(create_dummy_vm_config()).unwrap();
+            let api_evt = vmm.api_evt.try_clone().unwrap();
+            let exit_evt = vmm.exit_evt.try_clone().unwrap();
+            let (sender, receiver) = channel();
+            api_evt.write(u64::MAX - 1).unwrap();
+            assert!(matches!(
+                VmBootWithResources.send(
+                    api_evt.try_clone().unwrap(),
+                    sender.clone(),
+                    XdpBootResources::new()
+                ),
+                Err(ApiError::EventFdWrite(_))
+            ));
+            // Clear the saturated notification, not the cancelled queued request.
+            api_evt.read().unwrap();
+            let (response_sender, responses) = channel();
+            for _ in 0..count {
+                sender
+                    .send(VmInfo.request((), response_sender.clone()))
+                    .unwrap();
+                api_evt.write(1).unwrap();
+            }
+            let worker = thread::spawn(move || {
+                vmm.control_loop(
+                    &receiver,
+                    #[cfg(feature = "guest_debug")]
+                    &channel().1,
+                )
+            });
+            let received: result::Result<Vec<_>, _> = (0..count)
+                .map(|_| responses.recv_timeout(Duration::from_secs(5)))
+                .collect();
+            exit_evt.write(1).unwrap();
+            worker.join().unwrap().unwrap();
+            for response in received.unwrap() {
+                assert!(matches!(response, Ok(ApiResponsePayload::VmInfo(_))));
+            }
+        }
+    }
+
+    #[cfg(devcli_testenv)]
+    #[test]
+    fn test_api_sender_disconnect_keeps_vmm_running() {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        use crate::api::{ApiAction, ApiResponsePayload, VmInfo};
+
+        let mut vmm = create_dummy_vmm();
+        vmm.vm_create(create_dummy_vm_config()).unwrap();
+        let api_evt = vmm.api_evt.try_clone().unwrap();
+        let exit_evt = vmm.exit_evt.try_clone().unwrap();
+        let (sender, receiver) = channel();
+        let (response_sender, responses) = channel();
+        sender.send(VmInfo.request((), response_sender)).unwrap();
+        api_evt.write(1).unwrap();
+        drop(sender);
+        let (completed, completion) = channel();
+        let worker = thread::spawn(move || {
+            let result = vmm.control_loop(
+                &receiver,
+                #[cfg(feature = "guest_debug")]
+                &channel().1,
+            );
+            completed.send(()).unwrap();
+            result
+        });
+        let response = responses.recv_timeout(Duration::from_secs(5));
+        // A stale wake-up must also leave a closed, drained channel idle.
+        api_evt.write(1).unwrap();
+        let early_exit = completion.recv_timeout(Duration::from_millis(100));
+        exit_evt.write(1).unwrap();
+        let result = worker.join().unwrap();
+        assert!(matches!(
+            response.unwrap(),
+            Ok(ApiResponsePayload::VmInfo(_))
+        ));
+        assert!(matches!(early_exit, Err(RecvTimeoutError::Timeout)));
+        result.unwrap();
     }
 
     #[test]

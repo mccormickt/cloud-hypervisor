@@ -4,11 +4,11 @@
 
 //! Linux capability management for the in-process AF_XDP backend.
 //!
-//! The AF_XDP backend loads its XDP redirect program and populates `xsks_map`
-//! during device creation (`Vm::new`), which needs `CAP_BPF` and
-//! `CAP_NET_ADMIN`. Socket creation also needs `CAP_NET_RAW`. The bound
-//! datapath needs none of these capabilities. [`drop_xdp_caps`] removes setup
-//! authority before vCPU/worker threads start, including during restore.
+//! Standalone setup loads an XDP program and populates `xsks_map` during
+//! device creation (`Vm::new`), which needs `CAP_BPF` and `CAP_NET_ADMIN`.
+//! Socket creation also needs `CAP_NET_RAW`. Prepared endpoints need no setup
+//! authority on the consuming VMM thread. Both paths use [`drop_xdp_caps`]
+//! before vCPU/worker threads start, including during restore.
 //!
 //! Capabilities are per-thread on Linux. This drops them on the current (vmm)
 //! thread only; threads spawned afterwards inherit the reduced set, but
@@ -110,7 +110,7 @@ fn capability_data() -> io::Result<[CapUserData; LINUX_CAPABILITY_U32S_3]> {
     Ok(data)
 }
 
-/// Rejects attempts to recreate privileged AF_XDP resources in a restricted VMM.
+/// Rejects standalone setup in a restricted VMM. Prepared endpoints bypass it.
 pub(crate) fn check_xdp_setup() -> io::Result<()> {
     if BPF_RESTRICTED.get() {
         return Err(io::Error::other(

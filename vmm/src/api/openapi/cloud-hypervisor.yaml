@@ -1349,7 +1349,7 @@ components:
           default: "Client"
         xdp_iface:
           type: string
-          description: Dedicated host interface for AF_XDP queue 0. Required for af_xdp.
+          description: Host interface for AF_XDP. Required for af_xdp. Standalone setup binds queue 0.
         xdp_peer:
           type: string
           description: Optional veth peer for an FD-owned pass-through XDP program.
@@ -1361,6 +1361,10 @@ components:
           type: boolean
           default: false
           description: Require NIC zero-copy support. No copy fallback is used.
+        xdp_external:
+          type: boolean
+          default: false
+          description: Require a prepared endpoint from the in-process boot API, an explicit nonempty id, and no peer/skb options. HTTP boot cannot supply endpoints.
         id:
           type: string
         pci_segment:

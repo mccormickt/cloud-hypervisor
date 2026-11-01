@@ -30,9 +30,9 @@ It builds the pinned linker from source with Cargo checksum verification.
 
 ## Privilege model (load-then-drop)
 
-Cloud Hypervisor loads the XDP redirect program **itself** and removes setup
-capabilities from the VMM thread before the guest runs. There is no second process,
-no `SCM_RIGHTS` handoff, and no control socket.
+In standalone mode, Cloud Hypervisor loads the XDP redirect program **itself**
+and removes setup capabilities from the VMM thread before the guest runs.
+There is no second process, no `SCM_RIGHTS` handoff, and no control socket.
 
 | Phase | Operation | Capability |
 |---|---|---|
@@ -107,19 +107,104 @@ frames. Packets on other queues pass to the host; they do not reach the guest.
 `backend=xdp` cannot be combined with `tap`, `fd`, `vhost_user`, or a virtual
 IOMMU.
 
+## Embedded setup with external steering
+
+The feature-gated Rust API separates endpoint preparation from packet workers:
+
+- `net_util::PreparedXdpNet::new(iface, bind_queue, XdpSocketConfig)` creates
+  CH-owned socket/UMEM/frame resources on the calling OS thread, in its network
+  namespace. It does not attach a program, create a map, or register a socket.
+- `PreparedXdpNet::as_fd()` (the `AsFd` trait) borrows the socket for the
+  runtime's map registration. Bind queue, map key, and guest queue index are
+  independent. An explicit nonzero bind queue still serves guest queue pair 0.
+- `PreparedXdpNet::release_fence()` returns a cloneable `XdpReleaseFence`.
+  Retain it before moving the endpoint. `wait()` blocks; `is_released()` polls.
+- `vmm::XdpBootResources` is a move-only map from logical NIC ID to endpoint.
+  `vmm::api::VmBootWithResources` consumes this map at boot. `VmCreate` stores
+  only serializable configuration, with no packet resources or raw socket FDs.
+
+For each external NIC, configure `backend=xdp,xdp_external=on`, `xdp_iface`,
+and a nonempty `id` (`NetConfig::pci_common.id`). IDs are logical names, not
+PCI addresses. The normal VM-wide rules apply: names starting with `__` are
+reserved, and IDs must be unique across devices. No additional character or
+length restriction applies. `xdp_peer` and `xdp_skb` must be unset: attachment
+mode belongs to the external steering owner, not to endpoint consumption.
+
+`XdpSocketConfig::zerocopy = false` explicitly binds with
+`XDP_COPY | XDP_USE_NEED_WAKEUP`; `true` binds with
+`XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP`. There is no automatic fallback. Generic
+(SKB) versus native XDP attachment is a separate runtime decision. Match
+`NetConfig::xdp_zerocopy` to the prepared socket mode. Preparation captures the
+interface label, index, and MTU; boot validates the label and mode without
+querying the VMM thread's network namespace. Both host and guest MTUs must fit
+the single-frame budget. Do not change the host MTU during endpoint use.
+
+An embedding runtime must serialize operations for each VM:
+
+1. On a pre-existing privileged setup/cleanup OS thread, prepare endpoints and
+   retain their release fences. Hold the external program, map-registration,
+   and queue-lease guards separately. CH must not own shared host links/maps.
+2. Register each borrowed socket FD in the runtime's steering map, using the
+   chosen independent map key. Install steering and policy before guest traffic.
+3. Move exactly one endpoint per external NIC ID into `XdpBootResources`, then
+   call `VmBootWithResources.send(api_evt, api_sender, resources)`. This blocks
+   for the VMM result. Extra, missing, and mismatched endpoints fail before
+   guest execution. Ordinary `VmBoot` cannot supply external endpoints and
+   never falls back to self-setup for an external NIC.
+4. On rejection or enqueue failure, revoke external registrations. Before
+   shutdown/delete, revoke steering so no new packets enter the endpoint.
+   `VmShutdown` drops the VM and its packet resources; packet workers stop
+   before their socket/UMEM ownership is released. Guest virtio reset instead
+   retains the endpoint for reactivation and does not signal its fence.
+5. Wait for release fences before queue/IP reuse. A fence covers CH ownership
+   only, not references held by maps or duplicated FDs, or deferred kernel
+   teardown. Even after complete cleanup, a bind can fail with transient
+   `EBUSY`. CH does not retry bind or recreate host interfaces. The runtime
+   must retain cleanup/lease state if revocation or rebind fails.
+
+The typed sender cancels pending resource transfer on eventfd notification
+failure if the VMM has not started the request; if execution has started, it
+waits for the result. Cancelled requests do not prevent later API requests
+from being dispatched. A disconnected request channel drops the resources and
+returns `ApiError::PreparedBootSend`. A received `ApiError::VmBoot` is a
+definite boot rejection. A lost response (`ApiError::ResponseRecv`) has an
+**unknown outcome**, not a definite rejection: revoke steering, shut down/join
+the VMM, then wait on the retained fences before queue/IP reuse. If a caller
+uses `ApiAction::request` directly, it owns notification and queued-request
+cancellation. Do not block a Tokio/async worker with boot, join, or fence waits.
+
+Prepared boot still removes setup capabilities and denies `bpf()` on the VMM
+thread. Helpers created later inherit these restrictions, including after a
+shutdown/start cycle. Keep privileged setup and map/link cleanup on an OS
+thread created before these restrictions, not on a helper spawned by the
+restricted VMM. Existing helpers do not gain restrictions retroactively.
+
+After `VmShutdown`, the same restricted VMM can boot with fresh prepared
+endpoints for the next resource generation. Consumed endpoints are never
+reused implicitly. Other devices must also be constructible under the reduced
+capability set. Automatic VM reboot, hotplug, and migration are not extended
+by this API; standalone self-setup still needs a fresh privileged VMM.
+
+The datapath preserves Ethernet bytes; it does not normalize L3 netkit headers
+or invent MAC addresses. A successful attach, bind, or TX completion does not
+prove bidirectional guest connectivity. The runtime must prove the exact
+topology, guest Ethernet/ND behavior, and policy enforcement. Redirected RX
+can bypass host stack firewall paths; external steering must enforce the
+required policy rather than assume stack firewall parity.
+
 ## Limitations
 
-- **Boot-only.** AF_XDP devices load their program while `CAP_BPF` is held, which
-  happens only at device creation. Hot-plug (`vm.add-net backend=xdp`) is
+- **Boot-only.** Standalone AF_XDP devices load their program while `CAP_BPF`
+  is held, which happens only at device creation. Hot-plug (`vm.add-net backend=xdp`) is
   rejected. Cold snapshot/restore works because the destination rebuilds the
   program and XSKs at `Vm::new` (capabilities still held); **live migration is
   refused** (in-flight ring state and the kernel-attached program cannot be
   transferred).
 - **Process lifecycle.** Guest virtio reset reuses the existing sockets. Full
-  VM reboot or another AF_XDP VM requires a fresh VMM process. Capability
-  removal is permanent and can also prevent later TAP/network hotplug.
-- **Attachment.** FD-owned links are required, so closing them detaches without
-  setup privileges. Legacy netlink-only attachment is unsupported.
+  VM reboot or another standalone AF_XDP VM requires a fresh VMM process.
+  Capability removal is permanent and can also prevent later TAP/network hotplug.
+- **Standalone attachment.** FD-owned links are required, so closing them
+  detaches without setup privileges. Legacy netlink-only attachment is unsupported.
 - **No offloads.** AF_XDP delivers raw L2 frames, so no checksum/TSO/UFO
   features are advertised. Performance gains have not been established by the
   included tests; compare against TAP with representative workloads.

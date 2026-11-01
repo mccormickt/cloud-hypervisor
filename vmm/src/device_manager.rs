@@ -1130,6 +1130,9 @@ pub struct DeviceManager {
 
     rate_limit_groups: HashMap<String, Arc<RateLimiterGroup>>,
 
+    #[cfg(feature = "net_backend_af_xdp")]
+    xdp_resources: crate::XdpBootResources,
+
     mmio_regions: Arc<Mutex<Vec<MmioRegion>>>,
 
     // Track shared pages for SEV-SNP VFIO
@@ -1227,6 +1230,7 @@ impl DeviceManager {
         #[cfg(not(target_arch = "riscv64"))] timestamp: Instant,
         snapshot: Option<&Snapshot>,
         dynamic: bool,
+        #[cfg(feature = "net_backend_af_xdp")] xdp_resources: crate::XdpBootResources,
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
         trace_scoped!("DeviceManager::new");
 
@@ -1464,6 +1468,8 @@ impl DeviceManager {
             pending_activations: Arc::new(Mutex::new(Vec::default())),
             acpi_platform_addresses: AcpiPlatformAddresses::default(),
             rate_limit_groups,
+            #[cfg(feature = "net_backend_af_xdp")]
+            xdp_resources,
             mmio_regions: Arc::new(Mutex::new(Vec::new())),
             #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
             sev_snp_shared_page_tracker,
@@ -3235,7 +3241,7 @@ impl DeviceManager {
 
     #[cfg(feature = "net_backend_af_xdp")]
     fn make_virtio_net_af_xdp_device(
-        &self,
+        &mut self,
         net_cfg: &NetConfig,
         id: &str,
         snapshot: Option<&Snapshot>,
@@ -3253,7 +3259,7 @@ impl DeviceManager {
             zerocopy: net_cfg.xdp_zerocopy,
         };
 
-        let net = virtio_devices::Net::new_with_xdp(
+        let net = virtio_devices::Net::new_with_xdp_resources(
             id.to_string(),
             xdp_cfg,
             net_cfg.mac,
@@ -3267,6 +3273,15 @@ impl DeviceManager {
                 .try_clone()
                 .map_err(DeviceManagerError::EventFd)?,
             state,
+            if net_cfg.xdp_external {
+                Some(self.xdp_resources.remove(id).ok_or_else(|| {
+                    DeviceManagerError::CreateVirtioNet(net::Error::XdpConfiguration(
+                        "missing prepared endpoint",
+                    ))
+                })?)
+            } else {
+                None
+            },
         )
         .map_err(DeviceManagerError::CreateVirtioNet)?;
 
@@ -3280,15 +3295,18 @@ impl DeviceManager {
     /// Add virto-net and vhost-user-net devices
     fn make_virtio_net_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
         let mut net_devices = self.config.lock().unwrap().net.take();
-        if let Some(net_list_cfg) = &mut net_devices {
-            for net_cfg in net_list_cfg.iter_mut() {
-                let device = self.make_virtio_net_device(net_cfg, snapshot)?;
-                self.virtio_devices.push(device);
+        let result = (|| {
+            if let Some(net_list_cfg) = &mut net_devices {
+                for net_cfg in net_list_cfg.iter_mut() {
+                    let device = self.make_virtio_net_device(net_cfg, snapshot)?;
+                    self.virtio_devices.push(device);
+                }
             }
-        }
+            Ok(())
+        })();
         self.config.lock().unwrap().net = net_devices;
 
-        Ok(())
+        result
     }
 
     fn make_virtio_rng_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
