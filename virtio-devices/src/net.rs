@@ -30,9 +30,7 @@ use net_util::{
     TapError, TxVirtio, VirtioNetConfig, associate_taps, open_tap, vnet_hdr_len,
 };
 #[cfg(feature = "net_backend_af_xdp")]
-use net_util::{
-    XdpAttachMode, XdpProgram, XdpQueuePair, XdpSocketConfig, Xsk, iface_index, iface_mtu,
-};
+use net_util::{XdpAttachMode, XdpProgram, XdpQueuePair, XdpSocketConfig, Xsk, iface_mtu};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -774,9 +772,8 @@ impl EpollHelperHandler for XdpNetEpollHandler<'_> {
 
 /// Configuration for the in-process AF_XDP backend.
 ///
-/// One AF_XDP socket is bound per NIC hardware queue at device-creation time;
-/// the queue ids used are `0..num_queue_pairs`, so the interface must expose
-/// that many combined queues (`ethtool -L <iface> combined N`).
+/// Standalone setup binds host queue zero. A prepared endpoint can bind a
+/// different queue independently of the single guest queue pair.
 #[derive(Clone)]
 pub struct XdpBackendConfig {
     /// Host interface AF_XDP binds to.
@@ -791,6 +788,7 @@ pub struct XdpBackendConfig {
 }
 
 pub struct Net {
+    // Drop/join workers before the XDP program, sockets, and release fences.
     common: VirtioCommon,
     id: String,
     taps: Vec<Tap>,
@@ -1087,6 +1085,44 @@ impl Net {
         exit_evt: EventFd,
         state: Option<NetState>,
     ) -> Result<Self> {
+        Self::new_with_xdp_resources(
+            id,
+            xdp,
+            guest_mac,
+            mtu,
+            access_platform_enabled,
+            num_queues,
+            queue_size,
+            seccomp_action,
+            rate_limiter_config,
+            exit_evt,
+            state,
+            None,
+        )
+    }
+
+    /// Builds the packet device using a prepared endpoint when supplied.
+    ///
+    /// Prepared setup performs no interface query, program attachment, or map
+    /// operation. Its interface label and bind mode must match `xdp`; peer and
+    /// attachment options must be unset. The endpoint stays bound across guest
+    /// device reset; its release fence signals only on final endpoint teardown.
+    #[cfg(feature = "net_backend_af_xdp")]
+    #[expect(clippy::too_many_arguments)]
+    pub fn new_with_xdp_resources(
+        id: String,
+        xdp: XdpBackendConfig,
+        guest_mac: Option<MacAddr>,
+        mtu: Option<u16>,
+        access_platform_enabled: bool,
+        num_queues: u16,
+        queue_size: u16,
+        seccomp_action: SeccompAction,
+        rate_limiter_config: Option<RateLimiterConfig>,
+        exit_evt: EventFd,
+        state: Option<NetState>,
+        prepared: Option<net_util::PreparedXdpNet>,
+    ) -> Result<Self> {
         let num_queue_pairs = num_queues / 2;
         if num_queues != 2
             || state.as_ref().is_some_and(|s| {
@@ -1106,7 +1142,20 @@ impl Net {
         };
 
         // Both the host and guest must fit in the single-frame RX budget.
-        let host_mtu = iface_mtu(&xdp.iface).map_err(|e| Error::Xdp(Box::new(e)))?;
+        if prepared.as_ref().is_some_and(|endpoint| {
+            endpoint.iface() != xdp.iface
+                || endpoint.zerocopy() != xdp.zerocopy
+                || xdp.peer.is_some()
+                || xdp.skb_mode
+        }) {
+            return Err(Error::XdpConfiguration(
+                "prepared endpoint does not match config",
+            ));
+        }
+        let host_mtu = match &prepared {
+            Some(endpoint) => endpoint.mtu(),
+            None => iface_mtu(&xdp.iface).map_err(|e| Error::Xdp(Box::new(e)))?,
+        };
         let guest_mtu = state
             .as_ref()
             .map(|s| s.config.mtu)
@@ -1158,34 +1207,37 @@ impl Net {
                 )
             };
 
-        // Build the datapath eagerly, while the vmm thread still holds
-        // CAP_BPF/CAP_NET_ADMIN, before any restored devices are activated.
-        // We load and attach the redirect program, then bind one XSK per queue
-        // pair and register it in `xsks_map[queue_id]`. Workers borrow these
-        // sockets, which remain owned by the device across guest resets.
-        let ifindex = iface_index(&xdp.iface).map_err(|e| Error::Xdp(Box::new(e)))?;
-        let attach_mode = if xdp.skb_mode {
-            XdpAttachMode::Skb
+        let mut xdp_program = if prepared.is_some() {
+            None
         } else {
-            XdpAttachMode::Auto
-        };
-        let mut xdp_program =
-            XdpProgram::load_and_attach(&xdp.iface, xdp.peer.as_deref(), attach_mode)
+            let attach_mode = if xdp.skb_mode {
+                XdpAttachMode::Skb
+            } else {
+                XdpAttachMode::Auto
+            };
+            let program = XdpProgram::load_and_attach(&xdp.iface, xdp.peer.as_deref(), attach_mode)
                 .map_err(|e| Error::XdpProgram(Box::new(e)))?;
-
-        let socket_config = XdpSocketConfig {
-            zerocopy: xdp.zerocopy,
-            ..Default::default()
+            Some(program)
         };
-        let mut xsks = Vec::with_capacity(usize::from(num_queue_pairs));
-        for queue_id in 0..num_queue_pairs as u32 {
-            let xsk =
-                Xsk::new(ifindex, queue_id, socket_config).map_err(|e| Error::Xdp(Box::new(e)))?;
-            xdp_program
-                .insert_xsk(queue_id, &xsk)
+        let prepared = match prepared {
+            Some(endpoint) => endpoint,
+            None => net_util::PreparedXdpNet::new(
+                &xdp.iface,
+                0,
+                XdpSocketConfig {
+                    zerocopy: xdp.zerocopy,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| Error::Xdp(Box::new(e)))?,
+        };
+        let xsk = prepared.into_xsk();
+        if let Some(program) = &mut xdp_program {
+            program
+                .insert_xsk(0, &xsk)
                 .map_err(|e| Error::XdpProgram(Box::new(e)))?;
-            xsks.push(Arc::new(Mutex::new(xsk)));
         }
+        let xsks = vec![Arc::new(Mutex::new(xsk))];
 
         Ok(Net {
             common: VirtioCommon {
@@ -1209,7 +1261,7 @@ impl Net {
             device_status: Arc::new(AtomicU8::new(0)),
             xdp: Some(xdp),
             announce: AnnouncementState::new(false).map_err(Error::CreateEventFd)?,
-            xdp_program: Some(xdp_program),
+            xdp_program,
             xsks: Some(xsks),
         })
     }
@@ -2090,8 +2142,10 @@ mod tests {
     #[cfg(all(devcli_testenv, feature = "net_backend_af_xdp"))]
     #[test]
     fn test_xdp_reset_and_timer_progress() {
+        use std::os::fd::AsFd;
         use std::thread;
 
+        use net_util::{PreparedXdpNet, iface_index};
         use vm_memory::{Bytes, GuestAddress};
         use vm_virtio::queue::testing::VirtQueue;
 
@@ -2104,15 +2158,8 @@ mod tests {
             XdpSocketConfig::default(),
         )
         .unwrap();
-        let mut net = test_net(0, None).unwrap();
-        net.xdp = Some(XdpBackendConfig {
-            iface: "xdp-test0".into(),
-            peer: None,
-            skb_mode: false,
-            zerocopy: false,
-        });
-        let socket = Xsk::new(
-            iface_index("xdp-test0").unwrap(),
+        let endpoint = PreparedXdpNet::new(
+            "xdp-test0",
             0,
             XdpSocketConfig {
                 tx_size: 64,
@@ -2121,9 +2168,29 @@ mod tests {
             },
         )
         .unwrap();
-        let socket_fd = socket.as_raw_fd();
-        program.insert_xsk(0, &socket).unwrap();
-        net.xsks = Some(vec![Arc::new(Mutex::new(socket))]);
+        let socket_fd = endpoint.as_fd().as_raw_fd();
+        let fence = endpoint.release_fence();
+        program.insert_socket(0, endpoint.as_fd()).unwrap();
+        let mut net = Net::new_with_xdp_resources(
+            "prepared-net".to_owned(),
+            XdpBackendConfig {
+                iface: "xdp-test0".to_owned(),
+                peer: None,
+                skb_mode: false,
+                zerocopy: false,
+            },
+            None,
+            None,
+            false,
+            2,
+            256,
+            SeccompAction::Allow,
+            None,
+            EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            None,
+            Some(endpoint),
+        )
+        .unwrap();
         let mem = GuestMemoryAtomic::new(
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100_0000)]).unwrap(),
         );
@@ -2199,6 +2266,10 @@ mod tests {
                 .unwrap();
             assert_eq!(received, packet[vnet_hdr_len()..]);
             net.reset();
+            assert!(
+                !fence.is_released(),
+                "reset must retain the packet endpoint"
+            );
             assert_eq!(
                 net.xsks.as_ref().unwrap()[0].lock().unwrap().as_raw_fd(),
                 socket_fd
@@ -2250,6 +2321,29 @@ mod tests {
             handler.arm_retry_timer().unwrap();
             assert_eq!(handler.retry_deadline, Some(earlier));
         }
+        drop(handler);
+        drop(xsk);
+        net.activate(ActivationContext {
+            mem: mem.clone(),
+            interrupt_cb: Arc::new(TestInterrupt::new()),
+            queues: vec![
+                (
+                    0,
+                    rx.create_queue(),
+                    EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                ),
+                (
+                    1,
+                    tx.create_queue(),
+                    EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                ),
+            ],
+            device_status: Arc::new(AtomicU8::new(0)),
+        })
+        .unwrap();
+        drop(net);
+        fence.wait();
+        assert!(fence.is_released());
     }
 
     struct RecordingAnnounceOps {
