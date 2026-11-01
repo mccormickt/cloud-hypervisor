@@ -15,7 +15,7 @@
 //! Closing the links detaches the programs without setup capabilities.
 
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use aya::maps::{MapData, MapError, XskMap};
 use aya::programs::links::FdLink;
@@ -139,9 +139,19 @@ impl XdpProgram {
     /// Registers a bound [`Xsk`] in `xsks_map[queue_id]` so the redirect program
     /// steers traffic on that RX queue into the socket.
     pub fn insert_xsk(&mut self, queue_id: u32, xsk: &Xsk) -> Result<(), XdpProgramError> {
+        self.insert_socket(queue_id, xsk.as_fd())
+    }
+
+    /// Registers a socket with an independent steering map key.
+    /// Binding and ownership of the socket stay with the caller.
+    pub fn insert_socket(
+        &mut self,
+        map_key: u32,
+        socket: BorrowedFd<'_>,
+    ) -> Result<(), XdpProgramError> {
         self.xsks_map
-            .set(queue_id, xsk.as_raw_fd(), 0)
-            .map_err(|e| XdpProgramError::InsertXsk(queue_id, e))
+            .set(map_key, socket.as_raw_fd(), 0)
+            .map_err(|e| XdpProgramError::InsertXsk(map_key, e))
     }
 }
 

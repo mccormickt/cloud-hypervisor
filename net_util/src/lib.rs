@@ -45,7 +45,9 @@ pub use tap::{Error as TapError, Tap, associate_taps};
 #[cfg(feature = "net_backend_af_xdp")]
 pub use xdp_queue_pair::{XdpQueuePair, XdpQueuePairError};
 #[cfg(feature = "net_backend_af_xdp")]
-pub use xsk::{XdpError, XdpSocketConfig, Xsk, iface_index, iface_mtu};
+pub use xsk::{
+    PreparedXdpNet, XdpError, XdpReleaseFence, XdpSocketConfig, Xsk, iface_index, iface_mtu,
+};
 
 #[derive(Error, Debug)]
 pub enum Error {

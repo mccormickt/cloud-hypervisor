@@ -3,14 +3,17 @@
 
 // Run with --cfg devcli_testenv in a network namespace containing an active
 // xdp-test0 veth interface. These tests need CAP_NET_RAW and sufficient memlock.
+// The prepared endpoint test needs at least two RX/TX queues on xdp-test0.
 #![cfg(all(devcli_testenv, feature = "net_backend_af_xdp"))]
 
+use std::os::fd::{AsFd, AsRawFd};
 use std::thread;
 use std::time::Duration;
 
+use aya::xsk::XskError;
 use net_util::{
-    NetCounters, XdpAttachMode, XdpProgram, XdpQueuePair, XdpSocketConfig, Xsk, iface_index,
-    vnet_hdr_len,
+    NetCounters, PreparedXdpNet, XdpAttachMode, XdpError, XdpProgram, XdpQueuePair,
+    XdpSocketConfig, Xsk, iface_index, vnet_hdr_len,
 };
 use virtio_queue::QueueT;
 use vm_memory::bitmap::AtomicBitmap;
@@ -43,6 +46,40 @@ fn free_tx_frames(xsk: &mut Xsk) -> usize {
         xsk.tx_recycle(index).unwrap();
     }
     count
+}
+
+#[test]
+fn prepared_endpoint_keeps_nonzero_queue_and_release_ownership() {
+    let endpoint = PreparedXdpNet::new("xdp-test0", 1, XdpSocketConfig::default()).unwrap();
+    assert_eq!(endpoint.iface(), "xdp-test0");
+    assert_eq!(endpoint.ifindex(), iface_index("xdp-test0").unwrap());
+    assert_eq!(endpoint.bind_queue(), 1);
+    assert!(!endpoint.zerocopy());
+    let fd = endpoint.as_fd().as_raw_fd();
+    // Dedicated UMEM bindings own one queue exclusively. Queue zero must
+    // remain available while a second owner of queue one must be rejected.
+    let queue_zero = Xsk::new(endpoint.ifindex(), 0, XdpSocketConfig::default()).unwrap();
+    let duplicate = Xsk::new(endpoint.ifindex(), 1, XdpSocketConfig::default());
+    assert!(matches!(
+        duplicate,
+        Err(XdpError::Xsk(XskError::Syscall(error)))
+            if error.io_error.raw_os_error() == Some(libc::EBUSY)
+    ));
+    let fence = endpoint.release_fence();
+    let waiter = fence.clone();
+    assert!(!fence.is_released());
+    let xsk = endpoint.into_xsk();
+    assert_eq!(xsk.as_raw_fd(), fd);
+    assert!(!fence.is_released());
+    let worker = thread::spawn(move || {
+        waiter.wait();
+        assert!(waiter.is_released());
+    });
+    drop(xsk);
+    worker.join().unwrap();
+    assert!(fence.is_released());
+    // No bind-after-close assertion: kernel teardown can defer queue release.
+    drop(queue_zero);
 }
 
 #[test]

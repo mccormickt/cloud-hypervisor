@@ -10,16 +10,14 @@
 //!
 //! # Privilege model
 //!
-//! The XDP redirect program and its `xsks_map` are loaded in-process by
-//! [`crate::bpf::XdpProgram`] while CH still holds `CAP_BPF`/`CAP_NET_ADMIN`
-//! (at device creation). This module only performs the `CAP_NET_RAW` half:
-//! it creates and binds the [`aya::xsk::XskSocket`] and drives its rings. Each
-//! bound socket fd is inserted into `xsks_map[queue_id]` via
-//! [`crate::bpf::XdpProgram::insert_xsk`] before the privileged capabilities are
-//! dropped, so the datapath never depends on `bpf()`.
+//! This module creates and binds sockets using `CAP_NET_RAW`, without loading
+//! programs or updating maps. Steering is registered separately, either by
+//! [`crate::XdpProgram`] for standalone use or by the embedding runtime. Bind
+//! queues, guest queue indices, and steering map keys are independent.
 
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::ptr::{self, NonNull};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use std::{io, mem};
 
@@ -53,6 +51,8 @@ pub enum XdpError {
     InvalidFrameCount,
     #[error("AF_XDP frame size {0} is unsupported; expected 4096")]
     InvalidFrameSize(u32),
+    #[error("AF_XDP host MTU {0} exceeds the single-frame budget")]
+    InvalidMtu(u16),
 }
 
 /// Parameters for building an [`Xsk`].
@@ -247,12 +247,124 @@ pub struct Xsk {
     tx_pool: TxPool,
     zerocopy: bool,
     rx_wake_deadline: Option<Instant>,
+    // Must drop after the socket and UMEM mapping.
+    release: EndpointRelease,
 }
 
 // SAFETY: `Xsk` is moved to exactly one virtio worker thread and accessed only
 // from there. The raw pointers it transitively holds (the UMEM mapping and the
 // XSK ring mappings) are never shared with another thread.
 unsafe impl Send for Xsk {}
+
+/// Completion fence for CH's socket, UMEM, and packet-worker ownership.
+///
+/// This does not track references held by external maps or duplicated FDs.
+/// Revoke those separately before reusing the queue lease. A lost API response
+/// does not prove boot failed; shut down/join the VMM before waiting if needed.
+#[derive(Clone)]
+pub struct XdpReleaseFence(Arc<(Mutex<bool>, Condvar)>);
+
+impl XdpReleaseFence {
+    pub fn is_released(&self) -> bool {
+        *self.0.0.lock().unwrap()
+    }
+
+    /// Blocks until CH releases the endpoint. Do not call on an async worker.
+    /// Kernel deferred teardown can still cause a subsequent bind to fail.
+    pub fn wait(&self) {
+        let (released, notify) = &*self.0;
+        drop(
+            notify
+                .wait_while(released.lock().unwrap(), |released| !*released)
+                .unwrap(),
+        );
+    }
+}
+
+struct EndpointRelease(XdpReleaseFence);
+
+impl Drop for EndpointRelease {
+    fn drop(&mut self) {
+        let (released, notify) = &*self.0.0;
+        *released.lock().unwrap() = true;
+        notify.notify_all();
+    }
+}
+
+/// A bound packet endpoint prepared on a thread with socket setup authority.
+///
+/// This owns the socket, UMEM, and frame ledger, but no program, link, or map.
+/// The caller registers its borrowed FD in external steering before boot.
+/// Each boot attempt consumes a fresh endpoint. External registrations can
+/// retain the socket after this value drops: the steering owner must revoke
+/// them on enqueue failure, boot rejection, and shutdown, before queue reuse.
+pub struct PreparedXdpNet {
+    xsk: Xsk,
+    iface: String,
+    ifindex: u32,
+    bind_queue: u32,
+    mtu: u16,
+}
+
+impl PreparedXdpNet {
+    /// Binds one queue without attaching a program or changing any map.
+    ///
+    /// `zerocopy = false` explicitly requests copy mode, not auto mode.
+    /// Both modes request NEED_WAKEUP. Generic/native program attachment is
+    /// independent of socket binding and is the steering owner's decision.
+    /// Interface queries run in the calling thread's network namespace.
+    pub fn new(iface: &str, bind_queue: u32, config: XdpSocketConfig) -> Result<Self, XdpError> {
+        let ifindex = iface_index(iface)?;
+        let mtu = iface_mtu(iface)?;
+        if mtu > crate::XDP_MAX_MTU {
+            return Err(XdpError::InvalidMtu(mtu));
+        }
+        Ok(Self {
+            xsk: Xsk::new(ifindex, bind_queue, config)?,
+            iface: iface.to_owned(),
+            ifindex,
+            bind_queue,
+            mtu,
+        })
+    }
+
+    pub fn iface(&self) -> &str {
+        &self.iface
+    }
+
+    pub fn ifindex(&self) -> u32 {
+        self.ifindex
+    }
+
+    /// The netdev bind queue, not the external map key or guest queue index.
+    pub fn bind_queue(&self) -> u32 {
+        self.bind_queue
+    }
+
+    /// Host MTU captured during privileged preparation.
+    pub fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    pub fn zerocopy(&self) -> bool {
+        self.xsk.zerocopy
+    }
+
+    /// Retain this fence before transferring the endpoint into a boot request.
+    pub fn release_fence(&self) -> XdpReleaseFence {
+        self.xsk.release.0.clone()
+    }
+
+    pub fn into_xsk(self) -> Xsk {
+        self.xsk
+    }
+}
+
+impl AsFd for PreparedXdpNet {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.xsk.as_fd()
+    }
+}
 
 impl Xsk {
     /// Creates and binds an AF_XDP socket on `(ifindex, queue_id)` and primes
@@ -320,6 +432,7 @@ impl Xsk {
             rx_wake_deadline: config
                 .zerocopy
                 .then(|| Instant::now() + RX_WAKE_RETRY_WINDOW),
+            release: EndpointRelease(XdpReleaseFence(Arc::default())),
         })
     }
 
@@ -457,6 +570,12 @@ impl Xsk {
 impl AsRawFd for Xsk {
     fn as_raw_fd(&self) -> RawFd {
         self.socket.as_raw_fd()
+    }
+}
+
+impl AsFd for Xsk {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.as_fd()
     }
 }
 
